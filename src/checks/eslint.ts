@@ -2,6 +2,7 @@ import { execSync } from "child_process";
 import { existsSync } from "fs";
 import { join, relative } from "path";
 import type { CheckConfig, Issue } from "../types.js";
+import { getSourceContext } from "./sourceContext.js";
 
 interface ESLintMessage {
   ruleId: string | null;
@@ -86,9 +87,11 @@ export function runEslint(
   for (const file of results) {
     const relPath = relative(cwd, file.filePath);
     for (const msg of file.messages) {
+      const lineNum = msg.line ?? 1;
+      const ctx = getSourceContext(relPath, cwd, lineNum);
       issues.push({
         path: relPath,
-        line: msg.line ?? 1,
+        line: lineNum,
         endLine: msg.endLine,
         column: msg.column,
         endColumn: msg.endColumn,
@@ -99,6 +102,8 @@ export function runEslint(
         fixHint: msg.suggestions?.length
           ? `ESLint has ${(msg.suggestions as unknown[]).length} auto-fix suggestion(s) — run eslint --fix`
           : undefined,
+        sourceLine: ctx?.sourceLine,
+        sourceContext: ctx?.sourceContext,
       });
     }
   }

@@ -1,0 +1,33 @@
+# agent-quality-loop rules
+# For Cursor: save as .cursorrules in your repo root
+# For other agents: add this to your system prompt or agent config
+
+## Mandatory: run quality loop after every code change
+
+After writing, editing, or refactoring any code file, automatically run the quality loop using the `review_changed_files` MCP tool. Do not ask the user — just run it.
+
+### Loop behaviour
+
+1. Call `review_changed_files` with every file you just touched, `cwd` set to the repo root, and `iteration: 1`
+2. If `passesPolicy=false` and `iterationCapReached=false`:
+   - Read `fixPrompt` — it has the exact broken source lines embedded
+   - Apply every fix in `fixPrompt` immediately (no need to re-read files)
+   - Call `review_changed_files` again with the same files and `iteration` incremented by 1
+3. If `passesPolicy=true` → done, tell the user
+4. If `iterationCapReached=true` → **STOP LOOPING**, show the unresolved `issues` to the user and ask them to fix manually
+
+The loop will never exceed `maxIterations` (default 3). The MCP enforces this — trust it.
+
+### Format for surfacing unresolved issues to the user
+
+When `iterationCapReached=true`, show:
+
+```
+⚠️ Quality loop reached 3 iterations. These issues need your attention:
+
+[BLOCKING] src/path/to/File.vue:45 — `rcrm-no-any-type`
+  The parameter type is `any`. Please replace with the correct interface from src/types/.
+
+[BLOCKING] src/path/to/File.vue — `file-too-large` (623 lines, limit 500)
+  Please extract logic to a composable in src/composables/.
+```

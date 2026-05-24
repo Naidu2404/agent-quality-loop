@@ -6,6 +6,7 @@ import { runTypecheck } from "../checks/typescript.js";
 import { runPrettier } from "../checks/prettier.js";
 import { runCustomRules } from "../checks/customRules.js";
 import { runFileSizeCheck } from "../checks/fileSize.js";
+import { clearCache } from "../checks/sourceContext.js";
 import { loadConfig } from "../config/loader.js";
 import { stackLabel } from "../detector/techStack.js";
 import type { Issue, ReviewResult } from "../types.js";
@@ -15,12 +16,22 @@ export interface ReviewChangedFilesInput {
   files?: string[];
   /** Working directory (repo root). Defaults to process.cwd(). */
   cwd?: string;
+  /**
+   * Current iteration number (1-based). The agent increments this on each retry.
+   * When iteration >= maxIterations and issues remain, the MCP returns iterationCapReached=true
+   * and the agent MUST stop and report unresolved issues to the user.
+   */
+  iteration?: number;
 }
 
 export async function reviewChangedFiles(
   input: ReviewChangedFilesInput
 ): Promise<ReviewResult> {
   const cwd = input.cwd ?? process.cwd();
+  const iteration = input.iteration ?? 1;
+  // Clear file content cache so each review run gets fresh reads
+  clearCache();
+
   const { config, configPath, stackInfo } = loadConfig(cwd);
 
   // Resolve file list
@@ -101,6 +112,9 @@ export async function reviewChangedFiles(
   const advisoryIssues = allIssues.filter((i) => !blockingSeverities.includes(i.severity));
   const passesPolicy = blockingIssues.length === 0;
 
+  const maxIterations = config.maxIterations ?? 3;
+  const iterationCapReached = !passesPolicy && iteration >= maxIterations;
+
   const summary = buildSummary({
     stack: stackLabel(stackInfo),
     configPath,
@@ -111,15 +125,24 @@ export async function reviewChangedFiles(
     blockingIssues,
     advisoryIssues,
     passesPolicy,
-    maxIterations: config.maxIterations ?? 3,
+    maxIterations,
+    iteration,
+    iterationCapReached,
     notes: config.notes,
   });
+
+  const fixPrompt = passesPolicy || iterationCapReached
+    ? undefined
+    : buildFixPrompt(blockingIssues, advisoryIssues, files, iteration, maxIterations);
 
   return {
     totalIssues: allIssues.length,
     blockingCount: blockingIssues.length,
     advisoryCount: advisoryIssues.length,
     passesPolicy,
+    fixPrompt,
+    iterationCapReached,
+    iteration,
     issues: allIssues,
     summary,
     checksRun,
@@ -163,6 +186,63 @@ function getGitChangedFiles(cwd: string): string[] {
   }
 }
 
+/**
+ * Builds a compact, token-efficient prompt the agent executes directly to fix all issues.
+ * Embeds the exact source lines so the agent doesn't need to re-read files.
+ * Blockers first, then advisories. Grouped by file for minimal output.
+ */
+function buildFixPrompt(
+  blockingIssues: Issue[],
+  advisoryIssues: Issue[],
+  files: string[],
+  iteration: number,
+  maxIterations: number
+): string {
+  const lines: string[] = [];
+
+  lines.push(`QUALITY LOOP [iteration ${iteration}/${maxIterations}] — apply ALL fixes below, then call review_changed_files again.`);
+  lines.push(`Pass iteration=${iteration + 1} on the next call. Stop only when passesPolicy=true.`);
+  lines.push(`Files: [${files.map(f => `"${f}"`).join(", ")}]`);
+  lines.push("");
+
+  const allToFix = [
+    ...blockingIssues.map(i => ({ ...i, label: "BLOCKING" })),
+    ...advisoryIssues.slice(0, 10).map(i => ({ ...i, label: "ADVISORY" })),
+  ];
+
+  // Group by file
+  const byFile = new Map<string, typeof allToFix>();
+  for (const issue of allToFix) {
+    if (!byFile.has(issue.path)) byFile.set(issue.path, []);
+    byFile.get(issue.path)!.push(issue);
+  }
+
+  for (const [file, fileIssues] of byFile.entries()) {
+    lines.push(`### ${file}`);
+    for (const issue of fileIssues) {
+      lines.push(`[${issue.label}] L${issue.line} \`${issue.ruleId}\``);
+      lines.push(`  Problem: ${issue.message}`);
+      if (issue.sourceLine) {
+        lines.push(`  Code:    ${issue.sourceLine}`);
+      }
+      if (issue.fixHint) {
+        lines.push(`  Fix:     ${issue.fixHint}`);
+      }
+      lines.push("");
+    }
+  }
+
+  if (advisoryIssues.length > 10) {
+    lines.push(`(+ ${advisoryIssues.length - 10} more advisory issues — shown after blockers are resolved)`);
+    lines.push("");
+  }
+
+  lines.push(`Next call: review_changed_files({ files: [${files.map(f => `"${f}"`).join(", ")}], cwd: "<same cwd>", iteration: ${iteration + 1} })`);
+  lines.push(`If passesPolicy=true → done. If iterationCapReached=true → STOP and show unresolved issues to the user.`);
+
+  return lines.join("\n");
+}
+
 function buildSummary(opts: {
   stack: string;
   configPath: string | null;
@@ -174,6 +254,8 @@ function buildSummary(opts: {
   advisoryIssues: Issue[];
   passesPolicy: boolean;
   maxIterations: number;
+  iteration: number;
+  iterationCapReached: boolean;
   notes?: string;
 }): string {
   const {
@@ -187,12 +269,14 @@ function buildSummary(opts: {
     advisoryIssues,
     passesPolicy,
     maxIterations,
+    iteration,
+    iterationCapReached,
     notes,
   } = opts;
 
   const lines: string[] = [];
 
-  lines.push(`## Quality Loop Review`);
+  lines.push(`## Quality Loop Review — iteration ${iteration}/${maxIterations}`);
   lines.push(`**Stack:** ${stack}`);
   lines.push(`**Config:** ${configPath ?? "auto-detected defaults"}`);
   lines.push(`**Files reviewed:** ${files.length}`);
@@ -205,17 +289,19 @@ function buildSummary(opts: {
   lines.push("");
 
   if (passesPolicy) {
-    lines.push(`✅ **PASSES POLICY** — no blocking issues found.`);
+    lines.push(`✅ **PASSES POLICY** — no blocking issues. Task is complete.`);
     if (advisoryIssues.length > 0) {
-      lines.push(
-        `   ${advisoryIssues.length} advisory issue(s) exist — review but not blocking.`
-      );
+      lines.push(`   ${advisoryIssues.length} advisory issue(s) exist — not blocking.`);
     }
+  } else if (iterationCapReached) {
+    lines.push(`🛑 **ITERATION CAP REACHED (${maxIterations}/${maxIterations}) — STOP ITERATING**`);
+    lines.push(`   Do NOT call review_changed_files again. Surface the issues below to the user.`);
+    lines.push(`   These issues require human judgment to resolve.`);
   } else {
     lines.push(
-      `❌ **FAILS POLICY** — ${blockingIssues.length} blocking issue(s) must be fixed.`
+      `❌ **FAILS POLICY** — ${blockingIssues.length} blocking issue(s). See fixPrompt.`
     );
-    lines.push(`   (max ${maxIterations} fix iterations recommended)`);
+    lines.push(`   Iteration ${iteration} of ${maxIterations} — apply fixPrompt and retry.`);
   }
 
   if (allIssues.length > 0) {

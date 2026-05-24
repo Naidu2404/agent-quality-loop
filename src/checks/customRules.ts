@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "fs";
 import { join, relative } from "path";
 import { minimatch } from "minimatch";
 import type { CustomRule, Issue } from "../types.js";
+import { getSourceContext } from "./sourceContext.js";
 
 /**
  * Evaluates the custom rule set against a list of files.
@@ -48,15 +49,19 @@ export function runCustomRules(
         lines.forEach((line, idx) => {
           const lineMatches = [...line.matchAll(regex)];
           for (const m of lineMatches) {
+            const lineNum = idx + 1;
+            const ctx = getSourceContext(relPath, cwd, lineNum);
             issues.push({
               path: relPath,
-              line: idx + 1,
+              line: lineNum,
               column: (m.index ?? 0) + 1,
               severity: rule.severity,
               category: "custom",
               ruleId: rule.id,
               message: rule.message,
               fixHint: rule.fixHint,
+              sourceLine: ctx?.sourceLine,
+              sourceContext: ctx?.sourceContext,
             });
           }
         });

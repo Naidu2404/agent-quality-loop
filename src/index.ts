@@ -24,6 +24,7 @@ import { z } from "zod";
 import { reviewChangedFiles } from "./tools/reviewChangedFiles.js";
 import { reviewWorkspacePolicy } from "./tools/reviewWorkspacePolicy.js";
 import { explainBlockers } from "./tools/explainBlockers.js";
+import { setupRepo } from "./tools/setupRepo.js";
 import type { ReviewResult } from "./types.js";
 
 const server = new McpServer({
@@ -35,7 +36,7 @@ const server = new McpServer({
 
 server.tool(
   "review_changed_files",
-  "Review a set of files (or auto-detect git-changed files) against ESLint, TypeScript, Prettier and repo-specific rules. Returns structured issues with severity, location and fix hints. Call this after writing or editing code to check quality before committing.",
+  "ALWAYS call this after writing or editing any code files. Works with any AI agent (Cursor, Claude, Copilot, etc). Reviews files against ESLint, TypeScript, Prettier, file-size limits, and repo-specific .quality-loop.json rules. Returns structured issues AND a ready-to-execute fixPrompt with the exact source lines embedded. AGENT LOOP INSTRUCTIONS: (1) Call with the files you just created or modified, iteration=1. (2) If passesPolicy=false AND iterationCapReached=false: read fixPrompt, apply every fix listed (source lines are in the response — do NOT re-read files), then call this tool again with iteration incremented by 1. (3) If passesPolicy=true: task is complete — tell the user. (4) If iterationCapReached=true: STOP — do NOT call again — show the remaining issues from the 'issues' array to the user in a readable format and ask them to resolve manually.",
   {
     files: z
       .array(z.string())
@@ -49,10 +50,16 @@ server.tool(
       .describe(
         "Absolute path to the project root / repo directory. Defaults to the current working directory."
       ),
+    iteration: z
+      .number()
+      .optional()
+      .describe(
+        "Current iteration number (1-based). Start at 1, increment by 1 on each retry. When this reaches maxIterations and issues remain, iterationCapReached=true is returned and the loop must stop."
+      ),
   },
-  async ({ files, cwd }) => {
+  async ({ files, cwd, iteration }) => {
     try {
-      const result: ReviewResult = await reviewChangedFiles({ files, cwd });
+      const result: ReviewResult = await reviewChangedFiles({ files, cwd, iteration });
       return {
         content: [
           {
@@ -189,6 +196,36 @@ server.tool(
             text: JSON.stringify({ error: true, message: String(error) }),
           },
         ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ─── Tool 4: setup_repo ──────────────────────────────────────────────────────
+
+server.tool(
+  "setup_repo",
+  "One-time setup for a repo. Writes CLAUDE.md and .cursorrules directly into the repo root so the quality loop runs automatically after every code change — no manual template copying needed. Also creates a starter .quality-loop.json if none exists. Call this once when adding the quality loop to a new project.",
+  {
+    cwd: z
+      .string()
+      .optional()
+      .describe("Absolute path to the repo root. Defaults to current working directory."),
+    overwrite: z
+      .boolean()
+      .optional()
+      .describe("Overwrite existing CLAUDE.md / .cursorrules files. Default: false (safe merge)."),
+  },
+  async ({ cwd, overwrite }) => {
+    try {
+      const result = setupRepo({ cwd, overwrite });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: JSON.stringify({ error: true, message: String(error) }) }],
         isError: true,
       };
     }

@@ -1,0 +1,63 @@
+# Quality Loop — Agent Instructions
+# Works with: Claude Code, Cursor, GitHub Copilot, Windsurf, or any MCP-compatible AI agent
+# Place this file at your repo root as CLAUDE.md (Claude Code) or add to your agent's system prompt
+
+## Mandatory quality loop after every code change
+
+You have the `agent-quality-loop` MCP available as a tool called `review_changed_files`.
+
+After creating, editing, or refactoring ANY code file you MUST run this loop:
+
+### Step-by-step
+
+```
+1. Call review_changed_files({ files: ["<every file you touched>"], cwd: "<repo root>", iteration: 1 })
+
+2. Check the response:
+
+   a) passesPolicy=true
+      → Quality check passed. Tell the user the task is complete.
+      → STOP.
+
+   b) passesPolicy=false AND iterationCapReached=false
+      → Read the `fixPrompt` field. It contains the exact broken lines — no need to re-read files.
+      → Apply every fix listed in fixPrompt immediately, in this same response.
+      → Call review_changed_files again with the SAME files and iteration+1.
+      → Go back to step 2.
+
+   c) iterationCapReached=true  ← HARD STOP
+      → Do NOT call review_changed_files again.
+      → Do NOT try to auto-fix any more.
+      → Show the user the unresolved issues from the `issues` array in a readable format.
+      → Tell the user these need manual attention and explain what each issue requires.
+      → STOP.
+```
+
+### Rules
+
+- Never ask the user "should I run the quality check?" — just run it automatically
+- Never ask for permission to apply fixes from fixPrompt — apply them in the same turn
+- Never loop more than maxIterations times (default: 3) — the MCP enforces this via iterationCapReached
+- The fixPrompt includes the exact source lines — you do NOT need to re-read any file between iterations
+
+### What the MCP checks
+
+- **ESLint** — lint violations (if ESLint is configured in the repo)
+- **TypeScript** — type errors via `tsc --noEmit`
+- **Prettier** — formatting violations
+- **File size** — Vue files over 500 lines, TS files over 400 lines
+- **Custom rules** — rules from `.quality-loop.json` in the repo root (e.g. no `any`, no deep watchers)
+
+### When iterationCapReached=true — what to show the user
+
+Format the unresolved issues like this:
+
+```
+⚠️ Quality loop stopped after 3 iterations. The following issues need your attention:
+
+**src/components/MyComp.vue:45** [rcrm-no-any-type]
+  The param type is `any`. I couldn't determine the correct interface — please check src/types/ and replace with the right type.
+
+**src/components/MyComp.vue** [file-too-large — 623 lines]
+  This file exceeds 500 lines. Please extract the data-fetching logic to a composable in src/composables/.
+```

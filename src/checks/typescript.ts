@@ -2,6 +2,7 @@ import { execSync } from "child_process";
 import { existsSync } from "fs";
 import { join, relative } from "path";
 import type { CheckConfig, Issue } from "../types.js";
+import { getSourceContext } from "./sourceContext.js";
 
 /**
  * Runs tsc --noEmit and parses the diagnostic output into normalized Issues.
@@ -42,6 +43,7 @@ export function runTypecheck(
 
   const issues = parseTscOutput(output, cwd);
   return { issues, skipped: false };
+
 }
 
 /**
@@ -70,15 +72,19 @@ function parseTscOutput(output: string, cwd: string): Issue[] {
       // leave as-is
     }
 
+    const lineNum = parseInt(lineStr, 10);
+    const ctx = getSourceContext(relPath, cwd, lineNum);
     issues.push({
       path: relPath,
-      line: parseInt(lineStr, 10),
+      line: lineNum,
       column: parseInt(colStr, 10),
       severity: tscSeverity === "error" ? "error" : "warning",
       category: "types",
       ruleId: code,
       message: message.trim(),
       fixHint: getTypeScriptHint(code),
+      sourceLine: ctx?.sourceLine,
+      sourceContext: ctx?.sourceContext,
     });
   }
 

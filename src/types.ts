@@ -17,6 +17,10 @@ export interface Issue {
   message: string;
   /** Optional one-line hint the agent can use to fix this issue */
   fixHint?: string;
+  /** The actual source line(s) from the file so the agent doesn't need to re-read it */
+  sourceLine?: string;
+  /** 1-2 lines of surrounding context (line before + after) */
+  sourceContext?: string;
 }
 
 // ─── Review result ──────────────────────────────────────────────────────────
@@ -31,6 +35,20 @@ export interface ReviewResult {
   /** Whether the review is clean enough to proceed (no blockers) */
   passesPolicy: boolean;
   issues: Issue[];
+  /**
+   * Compact, token-efficient prompt the agent should execute immediately to fix all blocking issues.
+   * Includes the exact source lines so the agent does not need to re-read any file.
+   * After applying all fixes, call review_changed_files again with the same files.
+   * Only present when passesPolicy=false.
+   */
+  fixPrompt?: string;
+  /**
+   * Present only when the iteration cap is reached and issues still remain.
+   * The agent must STOP iterating and surface this to the user as a human task.
+   */
+  iterationCapReached?: boolean;
+  /** Which iteration this result is from (1-based) */
+  iteration?: number;
   /** Human-readable summary for the agent */
   summary: string;
   /** Which checks ran */
