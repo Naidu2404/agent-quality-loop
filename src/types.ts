@@ -62,6 +62,17 @@ export interface CheckConfig {
   extraArgs?: string[];
 }
 
+export interface FileSizeRule {
+  /** Glob for files this limit applies to, e.g. "**&#47;*.vue" */
+  glob: string;
+  /** Max allowed lines (default 500) */
+  maxLines: number;
+  /** Severity when exceeded */
+  severity: Severity;
+  /** What to do hint */
+  fixHint?: string;
+}
+
 export interface QualityLoopConfig {
   /** Which checks to run */
   checks: {
@@ -69,6 +80,8 @@ export interface QualityLoopConfig {
     typescript?: CheckConfig;
     prettier?: CheckConfig;
   };
+  /** File size limits — files exceeding these trigger issues */
+  fileSizeLimits?: FileSizeRule[];
   /** Custom rules evaluated by the MCP itself */
   customRules?: CustomRule[];
   /** Severities that must be zero for passesPolicy=true (default: ["error"]) */

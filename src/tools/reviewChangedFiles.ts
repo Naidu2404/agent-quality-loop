@@ -5,6 +5,7 @@ import { runEslint } from "../checks/eslint.js";
 import { runTypecheck } from "../checks/typescript.js";
 import { runPrettier } from "../checks/prettier.js";
 import { runCustomRules } from "../checks/customRules.js";
+import { runFileSizeCheck } from "../checks/fileSize.js";
 import { loadConfig } from "../config/loader.js";
 import { stackLabel } from "../detector/techStack.js";
 import type { Issue, ReviewResult } from "../types.js";
@@ -83,6 +84,15 @@ export async function reviewChangedFiles(
       checksRun.push("customRules");
       allIssues.push(...result.issues);
     }
+  }
+
+  // File size limits
+  const fileSizeResult = runFileSizeCheck(files, cwd, config.fileSizeLimits);
+  if (fileSizeResult.skipped) {
+    checksSkipped.push({ check: "fileSize", reason: fileSizeResult.skipReason ?? "skipped" });
+  } else {
+    checksRun.push("fileSize");
+    allIssues.push(...fileSizeResult.issues);
   }
 
   // Compute summary
