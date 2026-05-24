@@ -1,0 +1,51 @@
+{
+  "name": "agent-quality-loop",
+  "version": "1.0.0",
+  "description": "MCP server that guides AI agents to produce clean, policy-compliant code — runs ESLint, TypeScript, Prettier and repo-specific rules, then returns structured issues the agent can act on immediately.",
+  "keywords": [
+    "mcp",
+    "ai",
+    "code-quality",
+    "eslint",
+    "typescript",
+    "prettier",
+    "cursor",
+    "claude",
+    "agent"
+  ],
+  "author": "Venkateswara Naidu Moyya",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "agent-quality-loop": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "lint": "eslint src --ext .ts",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "glob": "^11.0.0",
+    "minimatch": "^10.2.5",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/agent-quality-loop"
+  }
+}

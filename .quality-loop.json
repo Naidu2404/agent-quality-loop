@@ -1,0 +1,30 @@
+{
+  "checks": {
+    "eslint": { "enabled": true },
+    "typescript": { "enabled": true },
+    "prettier": { "enabled": true }
+  },
+  "blockingseverities": ["error"],
+  "maxIterations": 3,
+  "notes": "Follow the team's coding standards. All exported functions must have JSDoc comments. Avoid inline styles in Vue components.",
+  "customRules": [
+    {
+      "id": "no-any-type",
+      "description": "Avoid TypeScript 'any' type",
+      "severity": "warning",
+      "pattern": ":\\s*any[;,\\s\\)]",
+      "message": "Avoid using 'any' — use a specific type or 'unknown'.",
+      "fixHint": "Replace with a specific type. Use 'unknown' + type guard if the shape is truly unknown.",
+      "glob": "**/*.{ts,tsx,vue}"
+    },
+    {
+      "id": "no-magic-numbers",
+      "description": "Magic numbers should be named constants",
+      "severity": "info",
+      "pattern": "(?<![\\w.])([2-9]\\d{2,}|[1-9]\\d{3,})(?![\\w])",
+      "message": "Magic number detected — consider extracting to a named constant.",
+      "fixHint": "Define a const (e.g. const MAX_RETRIES = 3) and reference it by name.",
+      "glob": "**/*.{ts,tsx,js,vue}"
+    }
+  ]
+}
