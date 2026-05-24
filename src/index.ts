@@ -25,6 +25,8 @@ import { reviewChangedFiles } from "./tools/reviewChangedFiles.js";
 import { reviewWorkspacePolicy } from "./tools/reviewWorkspacePolicy.js";
 import { explainBlockers } from "./tools/explainBlockers.js";
 import { setupRepo } from "./tools/setupRepo.js";
+import { identifyTraceCode } from "./tools/identifyTraceCode.js";
+import { verifyTraceRemoval } from "./tools/verifyTraceRemoval.js";
 import type { ReviewResult } from "./types.js";
 
 const server = new McpServer({
@@ -226,6 +228,80 @@ server.tool(
     } catch (error) {
       return {
         content: [{ type: "text", text: JSON.stringify({ error: true, message: String(error) }) }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ─── Tool 5: identify_trace_code ─────────────────────────────────────────────
+
+server.tool(
+  "identify_trace_code",
+  "Scans source files for trace code — unused imports, variables, functions, types, classes, duplicate imports, dead code after return, empty functions, and commented-out code. Returns a compact removePrompt that tells the agent exactly what to delete (grouped by file, safe vs review-required). AGENT LOOP INSTRUCTIONS: (1) Call this tool with the files you want to scan (or omit files to scan git-changed files, or pass [\"*\"] to scan the whole workspace). (2) Read removePrompt — it lists every item to remove with the exact source line embedded. (3) Apply ALL safe removals immediately. (4) For review-required items, use judgment — check if the symbol is truly unused before removing. (5) After all removals, call verify_trace_removal with the same files. (6) If verify passes → done. If new errors appear → read revertPrompt and revert the specific removal that broke something.",
+  {
+    cwd: z
+      .string()
+      .optional()
+      .describe("Absolute path to the repo root. Defaults to current working directory."),
+    files: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Files to scan. Omit to scan git-changed files. Pass [\"*\"] to scan the whole workspace."
+      ),
+  },
+  async ({ cwd, files }) => {
+    try {
+      const result = await identifyTraceCode({ cwd, files });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: true, message: String(error) }),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ─── Tool 6: verify_trace_removal ────────────────────────────────────────────
+
+server.tool(
+  "verify_trace_removal",
+  "Verifies that trace code removals did not introduce new errors. Runs TypeScript type-checking and ESLint on the modified files and checks for any new errors. Call this immediately after applying removals from identify_trace_code. If passesVerification=true → removal is complete and safe. If passesVerification=false → read revertPrompt and revert the specific removal(s) that caused the errors, then call this tool again.",
+  {
+    cwd: z
+      .string()
+      .optional()
+      .describe("Absolute path to the repo root. Defaults to current working directory."),
+    files: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Files that were modified during trace removal. Omit to use git-changed files. Pass [\"*\"] to verify the whole workspace."
+      ),
+  },
+  async ({ cwd, files }) => {
+    try {
+      const result = verifyTraceRemoval({ cwd, files });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: true, message: String(error) }),
+          },
+        ],
         isError: true,
       };
     }
