@@ -94,7 +94,9 @@ function buildRemovePrompt(items: TraceItem[], files: string[], stack: string): 
 
   const lines: string[] = [];
   lines.push(`TRACE CODE — ${items.length} item(s) found in ${files.length} file(s). Stack: ${stack}`);
-  lines.push(`Apply removals below, then call verify_trace_removal with the same files.`);
+  lines.push(`YOU MUST apply every SAFE TO REMOVE item below immediately in this same response. Do NOT ask the user. Do NOT summarize and wait. Apply the removals now.`);
+  lines.push(`For REQUIRES REVIEW items — use judgment, check if the symbol is truly unused, then remove if confirmed.`);
+  lines.push(`After all removals, call: verify_trace_removal({ files: [${files.map((f) => `"${f}"`).join(", ")}], cwd: "<same cwd>" })`);
   lines.push("");
 
   if (safe.length > 0) {
@@ -129,8 +131,7 @@ function buildRemovePrompt(items: TraceItem[], files: string[], stack: string): 
     }
   }
 
-  lines.push(`After applying removals: call verify_trace_removal({ files: [${files.map((f) => `"${f}"`).join(", ")}], cwd: "<same cwd>" })`);
-  lines.push(`If verify passes → done. If new errors appear → the removal broke something — revert that specific removal.`);
+  lines.push(`If verify passes → done, tell the user. If new errors appear → revert that specific removal and call verify_trace_removal again.`);
 
   return lines.join("\n");
 }

@@ -2,6 +2,7 @@ import { existsSync, writeFileSync, readFileSync } from "fs";
 import { join } from "path";
 import { loadConfig } from "../config/loader.js";
 import { stackLabel } from "../detector/techStack.js";
+import type { QualityLoopConfig } from "../types.js";
 
 export interface SetupRepoInput {
   /** Absolute path to the repo root. Defaults to process.cwd(). */
@@ -12,7 +13,18 @@ export interface SetupRepoInput {
 
 export interface SetupRepoResult {
   written: { file: string; status: "created" | "skipped" | "updated" }[];
+  credentialSetup: CredentialSetupItem[];
   summary: string;
+}
+
+export interface CredentialSetupItem {
+  name: string;
+  envVar: string;
+  present: boolean;
+  required: boolean;
+  getItAt: string;
+  exportLine: string;
+  note: string;
 }
 
 const CLAUDE_MD_CONTENT = `# Quality Loop — Agent Instructions
@@ -90,7 +102,7 @@ Do NOT ask the user — just run it.
 export function setupRepo(input: SetupRepoInput): SetupRepoResult {
   const cwd = input.cwd ?? process.cwd();
   const overwrite = input.overwrite ?? false;
-  const { stackInfo, configPath } = loadConfig(cwd);
+  const { stackInfo, configPath, config } = loadConfig(cwd);
 
   const written: SetupRepoResult["written"] = [];
 
@@ -113,6 +125,10 @@ export function setupRepo(input: SetupRepoInput): SetupRepoResult {
           eslint: { enabled: stackInfo.hasEslint },
           typescript: { enabled: stackInfo.hasTypeScript },
           prettier: { enabled: stackInfo.hasPrettier },
+          ai: { enabled: false, model: "claude-haiku-4-5-20251001", focus: ["security", "sonar", "dependencies"] },
+          sonar: { enabled: false },
+          npmAudit: { enabled: true, minSeverity: "high" },
+          dependabot: { enabled: false },
         },
         blockingseverities: ["error"],
         maxIterations: 3,
@@ -127,41 +143,101 @@ export function setupRepo(input: SetupRepoInput): SetupRepoResult {
     written.push({ file: ".quality-loop.json", status: "skipped" });
   }
 
-  const summary = buildSetupSummary(written, stackLabel(stackInfo), hasConfig);
+  // Build credential setup guide based on which checks are enabled
+  const credentialSetup = buildCredentialSetup(config);
+  const summary = buildSetupSummary(written, stackLabel(stackInfo), hasConfig, credentialSetup);
 
-  return { written, summary };
+  return { written, credentialSetup, summary };
 }
 
-function writeTemplate(
-  fullPath: string,
-  content: string,
-  overwrite: boolean
-): SetupRepoResult["written"][number] {
-  const filename = fullPath.split("/").pop()!;
-  const exists = existsSync(fullPath);
+// ─── Credential setup builder ─────────────────────────────────────────────────
 
-  if (exists && !overwrite) {
-    return { file: filename, status: "skipped" };
-  }
+function buildCredentialSetup(config: QualityLoopConfig): CredentialSetupItem[] {
+  const items: CredentialSetupItem[] = [];
 
-  // If CLAUDE.md exists, append the quality loop section rather than overwrite
-  if (exists && filename === "CLAUDE.md" && !overwrite) {
-    const existing = readFileSync(fullPath, "utf8");
-    if (existing.includes("review_changed_files")) {
-      return { file: filename, status: "skipped" };
+  if (config.checks.ai?.enabled) {
+    const provider = config.checks.ai.provider;
+    const hasAnthropic = !!process.env.ANTHROPIC_API_KEY;
+    const hasOpenAI = !!process.env.OPENAI_API_KEY;
+    const hasGemini = !!process.env.GEMINI_API_KEY;
+    const anyKeyPresent = hasAnthropic || hasOpenAI || hasGemini || provider === "ollama";
+
+    if (!anyKeyPresent) {
+      items.push({
+        name: "AI analysis (pick one provider)",
+        envVar: "ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY",
+        present: false,
+        required: true,
+        getItAt: "See options below",
+        exportLine: [
+          '# Pick ONE of these — the provider is auto-detected from whichever key is set:',
+          'export ANTHROPIC_API_KEY="sk-ant-..."   # https://console.anthropic.com/settings/keys',
+          'export OPENAI_API_KEY="sk-..."           # https://platform.openai.com/api-keys',
+          'export GEMINI_API_KEY="AIza..."          # https://aistudio.google.com/app/apikey',
+          '# OR use Ollama (free, local): set checks.ai.provider: "ollama" in .quality-loop.json',
+        ].join('\n'),
+        note: "If you already use Claude Code, Claude desktop, or Cursor Pro, your ANTHROPIC_API_KEY may already be set.",
+      });
+    } else {
+      const activeProvider = hasAnthropic ? "Anthropic" : hasOpenAI ? "OpenAI" : hasGemini ? "Gemini" : "Ollama";
+      items.push({
+        name: `AI analysis (${activeProvider})`,
+        envVar: hasAnthropic ? "ANTHROPIC_API_KEY" : hasOpenAI ? "OPENAI_API_KEY" : "GEMINI_API_KEY",
+        present: true,
+        required: true,
+        getItAt: "",
+        exportLine: "",
+        note: `${activeProvider} key detected — AI analysis is ready.`,
+      });
     }
-    writeFileSync(fullPath, existing + "\n---\n\n" + content, "utf8");
-    return { file: filename, status: "updated" };
   }
 
-  writeFileSync(fullPath, content, "utf8");
-  return { file: filename, status: exists ? "updated" : "created" };
+  if (config.checks.sonar?.enabled) {
+    items.push({
+      name: "SonarCloud / SonarQube",
+      envVar: "SONAR_TOKEN",
+      present: !!process.env.SONAR_TOKEN,
+      required: true,
+      getItAt: "https://sonarcloud.io/account/security (My Account → Security → Generate Token)",
+      exportLine: 'export SONAR_TOKEN="sqp_..."',
+      note: "Create a User Token with 'Execute Analysis' permission on your project.",
+    });
+
+    if (!config.checks.sonar.projectKey && !process.env.SONAR_PROJECT_KEY) {
+      items.push({
+        name: "Sonar project key",
+        envVar: "SONAR_PROJECT_KEY",
+        present: false,
+        required: true,
+        getItAt: "Your SonarCloud project → Information tab → Project Key",
+        exportLine: 'export SONAR_PROJECT_KEY="your-org_your-repo"',
+        note: "Or set checks.sonar.projectKey directly in .quality-loop.json.",
+      });
+    }
+  }
+
+  if (config.checks.dependabot?.enabled) {
+    items.push({
+      name: "GitHub (Dependabot alerts)",
+      envVar: "GITHUB_TOKEN",
+      present: !!process.env.GITHUB_TOKEN,
+      required: true,
+      getItAt: "https://github.com/settings/tokens (Fine-grained token → Security events: Read)",
+      exportLine: 'export GITHUB_TOKEN="github_pat_..."',
+      note: "In GitHub Actions this is automatic — use ${{ secrets.GITHUB_TOKEN }}. For local use, create a fine-grained PAT with 'Security events' read access on your repo.",
+    });
+  }
+
+  return items;
 }
+
+// ─── Summary builder ──────────────────────────────────────────────────────────
 
 function buildSetupSummary(
   written: SetupRepoResult["written"],
   stack: string,
-  hadExistingConfig: boolean
+  hadExistingConfig: boolean,
+  credentialSetup: CredentialSetupItem[]
 ): string {
   const lines: string[] = [];
   lines.push(`## Quality Loop Setup — ${stack}`);
@@ -173,21 +249,94 @@ function buildSetupSummary(
   }
 
   lines.push("");
-  lines.push("### Next steps");
 
   if (!hadExistingConfig) {
-    lines.push("1. Open `.quality-loop.json` and add your project-specific custom rules");
-    lines.push("2. The agent will now automatically run the quality loop after every code change");
+    lines.push("### Next steps");
+    lines.push("1. Open `.quality-loop.json` and enable the checks you want (ai, sonar, dependabot)");
+    lines.push("2. Set the required environment variables (see below)");
+    lines.push("3. The agent will now automatically run the quality loop after every code change");
   } else {
+    lines.push("### Next steps");
     lines.push("1. Your existing `.quality-loop.json` config was preserved");
-    lines.push("2. The agent will now automatically run the quality loop after every code change");
+    lines.push("2. Set any missing environment variables (see below)");
+    lines.push("3. The agent will now automatically run the quality loop after every code change");
   }
 
   lines.push("");
-  lines.push("**The loop is now active.** The agent will:");
+  lines.push("**The quality loop is now active.** The agent will:");
   lines.push("- Call `review_changed_files` automatically after every code change");
-  lines.push("- Fix issues from `fixPrompt` in the same turn");
-  lines.push("- Hard-stop after 3 iterations and surface any unresolved issues to you");
+  lines.push("- Apply fixes from `fixPrompt` in the same turn — no back-and-forth");
+  lines.push("- Hard-stop after 3 iterations and surface unresolved issues to you");
+
+  // Credential setup section
+  if (credentialSetup.length > 0) {
+    lines.push("");
+    lines.push("---");
+    lines.push("## Environment variables needed");
+    lines.push("");
+
+    const missing = credentialSetup.filter((c) => !c.present);
+    const present = credentialSetup.filter((c) => c.present);
+
+    if (present.length > 0) {
+      for (const item of present) {
+        lines.push(`✅ **${item.envVar}** — already set (${item.name} is ready)`);
+      }
+      lines.push("");
+    }
+
+    if (missing.length > 0) {
+      lines.push("The following tokens are needed to enable all configured checks.");
+      lines.push("Add them to your shell profile (`~/.zshrc` or `~/.bashrc`) and restart your terminal:");
+      lines.push("");
+
+      for (const item of missing) {
+        lines.push(`### ${item.name}`);
+        lines.push(`**Missing:** \`${item.envVar}\``);
+        lines.push(`**Get it at:** ${item.getItAt}`);
+        lines.push(`**Add to shell profile:**`);
+        lines.push(`\`\`\`bash`);
+        lines.push(item.exportLine);
+        lines.push(`\`\`\``);
+        if (item.note) lines.push(`> ${item.note}`);
+        lines.push("");
+      }
+
+      lines.push("**After setting all tokens:** run `check_setup` to confirm everything is active.");
+    } else {
+      lines.push("✅ All required tokens are present — all configured checks are ready.");
+    }
+  } else {
+    lines.push("");
+    lines.push("**Tip:** Enable AI-powered checks (security, Sonar-style analysis, Dependabot) by adding `checks.ai`, `checks.sonar`, and `checks.dependabot` to `.quality-loop.json`. Then run `setup_repo` again to get the credential guide.");
+  }
 
   return lines.join("\n");
+}
+
+// ─── File writer ──────────────────────────────────────────────────────────────
+
+function writeTemplate(
+  fullPath: string,
+  content: string,
+  overwrite: boolean
+): SetupRepoResult["written"][number] {
+  const filename = fullPath.split("/").pop()!;
+  const exists = existsSync(fullPath);
+
+  if (exists && !overwrite) {
+    // If CLAUDE.md exists, append the quality loop section if not already there
+    if (filename === "CLAUDE.md") {
+      const existing = readFileSync(fullPath, "utf8");
+      if (existing.includes("review_changed_files")) {
+        return { file: filename, status: "skipped" };
+      }
+      writeFileSync(fullPath, existing + "\n---\n\n" + content, "utf8");
+      return { file: filename, status: "updated" };
+    }
+    return { file: filename, status: "skipped" };
+  }
+
+  writeFileSync(fullPath, content, "utf8");
+  return { file: filename, status: exists ? "updated" : "created" };
 }

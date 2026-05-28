@@ -91,12 +91,77 @@ export interface FileSizeRule {
   fixHint?: string;
 }
 
+export type AiProvider = "anthropic" | "openai" | "gemini" | "ollama";
+
+export interface AiCheckConfig {
+  enabled: boolean;
+  /**
+   * Which AI provider to use for analysis.
+   * • anthropic — requires ANTHROPIC_API_KEY  (default model: claude-haiku-4-5-20251001)
+   * • openai    — requires OPENAI_API_KEY     (default model: gpt-4o-mini)
+   * • gemini    — requires GEMINI_API_KEY     (default model: gemini-1.5-flash)
+   * • ollama    — no key needed, runs locally (default model: llama3.2)
+   * Default: "anthropic"
+   */
+  provider?: AiProvider;
+  /**
+   * Model override. If omitted, the provider's recommended cheap/fast model is used.
+   * anthropic: claude-haiku-4-5-20251001 | openai: gpt-4o-mini | gemini: gemini-1.5-flash | ollama: llama3.2
+   */
+  model?: string;
+  /** Ollama base URL. Default: http://localhost:11434 */
+  ollamaBaseUrl?: string;
+  /** Which categories to analyse. Default: all */
+  focus?: ("security" | "sonar" | "dependencies")[];
+  /** Max KB of file content to send per file. Default: 40 */
+  maxFileSizeKb?: number;
+  /** Only run AI analysis on this iteration number (avoids re-analysing on retries). Default: 1 */
+  runOnIteration?: number | "all";
+}
+
+export interface SonarCheckConfig {
+  enabled: boolean;
+  /** SonarCloud or SonarQube server URL. Default: https://sonarcloud.io */
+  serverUrl?: string;
+  /**
+   * Project key in Sonar. If omitted, reads SONAR_PROJECT_KEY env var.
+   * In SonarCloud this is usually "org_repo-name".
+   */
+  projectKey?: string;
+  /** SonarCloud organisation slug (required for SonarCloud, not SonarQube) */
+  organization?: string;
+}
+
+export interface DependabotCheckConfig {
+  enabled: boolean;
+  /** GitHub repo owner. Auto-detected from git remote if omitted. */
+  owner?: string;
+  /** GitHub repo name. Auto-detected from git remote if omitted. */
+  repo?: string;
+  /** Minimum alert severity to report: critical | high | medium | low. Default: high */
+  minSeverity?: "critical" | "high" | "medium" | "low";
+}
+
+export interface NpmAuditCheckConfig {
+  enabled: boolean;
+  /** Minimum vulnerability severity to treat as an issue. Default: high */
+  minSeverity?: "critical" | "high" | "moderate" | "low";
+}
+
 export interface QualityLoopConfig {
   /** Which checks to run */
   checks: {
     eslint?: CheckConfig;
     typescript?: CheckConfig;
     prettier?: CheckConfig;
+    /** AI-powered security + Sonar-style analysis via Claude Haiku */
+    ai?: AiCheckConfig;
+    /** Fetch real issues from SonarCloud / SonarQube */
+    sonar?: SonarCheckConfig;
+    /** Run npm audit for known CVEs in dependencies */
+    npmAudit?: NpmAuditCheckConfig;
+    /** Fetch open Dependabot alerts from GitHub */
+    dependabot?: DependabotCheckConfig;
   };
   /** File size limits — files exceeding these trigger issues */
   fileSizeLimits?: FileSizeRule[];

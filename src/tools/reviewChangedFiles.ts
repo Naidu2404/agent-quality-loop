@@ -7,6 +7,10 @@ import { runPrettier } from "../checks/prettier.js";
 import { runCustomRules } from "../checks/customRules.js";
 import { runFileSizeCheck } from "../checks/fileSize.js";
 import { clearCache } from "../checks/sourceContext.js";
+import { runAiAnalysis } from "../checks/aiAnalysis.js";
+import { runSonarCheck } from "../checks/sonar.js";
+import { runNpmAudit } from "../checks/npmAudit.js";
+import { runDependabotCheck } from "../checks/dependabot.js";
 import { loadConfig } from "../config/loader.js";
 import { stackLabel } from "../detector/techStack.js";
 import type { Issue, ReviewResult } from "../types.js";
@@ -106,6 +110,50 @@ export async function reviewChangedFiles(
     allIssues.push(...fileSizeResult.issues);
   }
 
+  // AI analysis (Claude Haiku — security, Sonar-style, dependency misuse)
+  if (config.checks.ai?.enabled) {
+    const aiResult = await runAiAnalysis(files, cwd, config.checks.ai, iteration);
+    if (aiResult.skipped) {
+      checksSkipped.push({ check: "ai", reason: aiResult.skipReason ?? "skipped" });
+    } else {
+      checksRun.push("ai");
+      allIssues.push(...aiResult.issues);
+    }
+  }
+
+  // SonarCloud / SonarQube
+  if (config.checks.sonar?.enabled) {
+    const sonarResult = await runSonarCheck(files, cwd, config.checks.sonar);
+    if (sonarResult.skipped) {
+      checksSkipped.push({ check: "sonar", reason: sonarResult.skipReason ?? "skipped" });
+    } else {
+      checksRun.push("sonar");
+      allIssues.push(...sonarResult.issues);
+    }
+  }
+
+  // npm audit (known CVEs in dependencies)
+  if (config.checks.npmAudit?.enabled) {
+    const auditResult = runNpmAudit(cwd, config.checks.npmAudit);
+    if (auditResult.skipped) {
+      checksSkipped.push({ check: "npmAudit", reason: auditResult.skipReason ?? "skipped" });
+    } else {
+      checksRun.push("npmAudit");
+      allIssues.push(...auditResult.issues);
+    }
+  }
+
+  // GitHub Dependabot alerts
+  if (config.checks.dependabot?.enabled) {
+    const dependabotResult = await runDependabotCheck(cwd, config.checks.dependabot);
+    if (dependabotResult.skipped) {
+      checksSkipped.push({ check: "dependabot", reason: dependabotResult.skipReason ?? "skipped" });
+    } else {
+      checksRun.push("dependabot");
+      allIssues.push(...dependabotResult.issues);
+    }
+  }
+
   // Compute summary
   const blockingSeverities = config.blockingseverities ?? ["error"];
   const blockingIssues = allIssues.filter((i) => blockingSeverities.includes(i.severity));
@@ -200,9 +248,9 @@ function buildFixPrompt(
 ): string {
   const lines: string[] = [];
 
-  lines.push(`QUALITY LOOP [iteration ${iteration}/${maxIterations}] — apply ALL fixes below, then call review_changed_files again.`);
-  lines.push(`Pass iteration=${iteration + 1} on the next call. Stop only when passesPolicy=true.`);
-  lines.push(`Files: [${files.map(f => `"${f}"`).join(", ")}]`);
+  lines.push(`QUALITY LOOP [iteration ${iteration}/${maxIterations}] — YOU MUST apply EVERY fix listed below immediately in this same response. Do NOT ask the user. Do NOT summarize and wait. Apply the fixes now.`);
+  lines.push(`After applying all fixes, call: review_changed_files({ files: [${files.map(f => `"${f}"`).join(", ")}], cwd: "<same cwd>", iteration: ${iteration + 1} })`);
+  lines.push(``);
   lines.push("");
 
   const allToFix = [
@@ -237,8 +285,7 @@ function buildFixPrompt(
     lines.push("");
   }
 
-  lines.push(`Next call: review_changed_files({ files: [${files.map(f => `"${f}"`).join(", ")}], cwd: "<same cwd>", iteration: ${iteration + 1} })`);
-  lines.push(`If passesPolicy=true → done. If iterationCapReached=true → STOP and show unresolved issues to the user.`);
+  lines.push(`If passesPolicy=true → done, tell the user. If iterationCapReached=true → STOP, do not call again, show unresolved issues to the user.`);
 
   return lines.join("\n");
 }

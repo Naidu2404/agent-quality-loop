@@ -2,21 +2,21 @@
 /**
  * agent-quality-loop — MCP server
  *
- * Exposes three tools to AI agents:
- *   1. review_changed_files      — review a specific set of files (or git-changed files)
- *   2. review_workspace_policy   — scan the whole workspace against the quality policy
- *   3. explain_blockers          — get a structured, agent-actionable breakdown of blocking issues
- *
- * Usage (Claude / Cursor MCP config):
- *   {
- *     "mcpServers": {
- *       "quality-loop": {
- *         "command": "npx",
- *         "args": ["-y", "agent-quality-loop"]
- *       }
- *     }
- *   }
+ * Run `npx agent-quality-loop --help` for the full usage guide.
  */
+
+// ─── CLI flags — handle before anything else ──────────────────────────────────
+import { printHelp, printVersion, printStartupBanner } from "./cli/help.js";
+
+const args = process.argv.slice(2);
+if (args.includes("--help") || args.includes("-h")) {
+  printHelp();
+  process.exit(0);
+}
+if (args.includes("--version") || args.includes("-v")) {
+  printVersion();
+  process.exit(0);
+}
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -27,6 +27,7 @@ import { explainBlockers } from "./tools/explainBlockers.js";
 import { setupRepo } from "./tools/setupRepo.js";
 import { identifyTraceCode } from "./tools/identifyTraceCode.js";
 import { verifyTraceRemoval } from "./tools/verifyTraceRemoval.js";
+import { checkSetup } from "./tools/checkSetup.js";
 import type { ReviewResult } from "./types.js";
 
 const server = new McpServer({
@@ -38,7 +39,7 @@ const server = new McpServer({
 
 server.tool(
   "review_changed_files",
-  "ALWAYS call this after writing or editing any code files. Works with any AI agent (Cursor, Claude, Copilot, etc). Reviews files against ESLint, TypeScript, Prettier, file-size limits, and repo-specific .quality-loop.json rules. Returns structured issues AND a ready-to-execute fixPrompt with the exact source lines embedded. AGENT LOOP INSTRUCTIONS: (1) Call with the files you just created or modified, iteration=1. (2) If passesPolicy=false AND iterationCapReached=false: read fixPrompt, apply every fix listed (source lines are in the response — do NOT re-read files), then call this tool again with iteration incremented by 1. (3) If passesPolicy=true: task is complete — tell the user. (4) If iterationCapReached=true: STOP — do NOT call again — show the remaining issues from the 'issues' array to the user in a readable format and ask them to resolve manually.",
+  "ALWAYS call this after writing or editing any code files. Reviews files against ESLint, TypeScript, Prettier, file-size limits, and repo-specific .quality-loop.json rules. THE RESPONSE TEXT IS YOUR INSTRUCTION SET — read it and act on it immediately without asking the user. AGENT LOOP: (1) Call with files you just created/modified, iteration=1. (2) The response will begin with either '✅ PASSES' (task done — tell user) OR a FIX PROMPT starting with 'QUALITY LOOP'. If you see a FIX PROMPT: apply EVERY fix listed right now in this same turn — source lines are embedded so you do NOT need to re-read any file. Then call this tool again with iteration+1. (3) If the response begins with '🛑 STOP': do NOT call again — copy the issue list to the user verbatim and ask them to fix manually. Never ask permission to apply fixes. Never skip a fix. Never loop after a STOP signal.",
   {
     files: z
       .array(z.string())
@@ -62,12 +63,30 @@ server.tool(
   async ({ files, cwd, iteration }) => {
     try {
       const result: ReviewResult = await reviewChangedFiles({ files, cwd, iteration });
+
+      // Surface the actionable text first so the agent treats it as instructions,
+      // not as data. JSON is appended second for reference only.
+      let primaryText: string;
+      if (result.passesPolicy) {
+        primaryText = `✅ PASSES — quality check passed. All ${result.checksRun?.join(", ") || "checks"} are clean. Task is complete — tell the user.`;
+      } else if (result.iterationCapReached) {
+        primaryText = [
+          `🛑 STOP — iteration cap reached. Do NOT call review_changed_files again.`,
+          `Show these unresolved issues to the user and ask them to fix manually:`,
+          ``,
+          ...result.issues
+            .filter((i) => i.severity === "error")
+            .map((i) => `[BLOCKING] ${i.path}:${i.line} — \`${i.ruleId}\`\n  ${i.message}${i.fixHint ? `\n  Fix: ${i.fixHint}` : ""}`),
+        ].join("\n");
+      } else {
+        // fixPrompt is the instruction set — put it front and centre
+        primaryText = result.fixPrompt ?? result.summary;
+      }
+
       return {
         content: [
-          {
-            type: "text",
-            text: JSON.stringify(result, null, 2),
-          },
+          { type: "text", text: primaryText },
+          { type: "text", text: `---\nFULL RESULT (reference):\n${JSON.stringify(result, null, 2)}` },
         ],
       };
     } catch (error) {
@@ -114,12 +133,18 @@ server.tool(
   async ({ cwd, include, exclude }) => {
     try {
       const result: ReviewResult = await reviewWorkspacePolicy({ cwd, include, exclude });
+
+      let primaryText: string;
+      if (result.passesPolicy) {
+        primaryText = `✅ PASSES — full workspace scan clean. ${result.totalIssues === 0 ? "No issues found." : ""} Task is complete.`;
+      } else {
+        primaryText = result.fixPrompt ?? result.summary;
+      }
+
       return {
         content: [
-          {
-            type: "text",
-            text: JSON.stringify(result, null, 2),
-          },
+          { type: "text", text: primaryText },
+          { type: "text", text: `---\nFULL RESULT (reference):\n${JSON.stringify(result, null, 2)}` },
         ],
       };
     } catch (error) {
@@ -127,10 +152,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify({
-              error: true,
-              message: String(error),
-            }),
+            text: JSON.stringify({ error: true, message: String(error) }),
           },
         ],
         isError: true,
@@ -222,8 +244,12 @@ server.tool(
   async ({ cwd, overwrite }) => {
     try {
       const result = setupRepo({ cwd, overwrite });
+      // Surface the summary (which includes the credential guide) as primary text
       return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        content: [
+          { type: "text", text: result.summary },
+          { type: "text", text: `---\nFULL RESULT (reference):\n${JSON.stringify(result, null, 2)}` },
+        ],
       };
     } catch (error) {
       return {
@@ -234,11 +260,41 @@ server.tool(
   }
 );
 
-// ─── Tool 5: identify_trace_code ─────────────────────────────────────────────
+// ─── Tool 5: check_setup ─────────────────────────────────────────────────────
+
+server.tool(
+  "check_setup",
+  "Reports the live status of every quality check — active, disabled, or misconfigured. Shows exactly which environment variables are missing, where to get each token, and the exact shell commands to add to the user's profile. Call this after setup_repo to confirm everything is working, or any time a check seems to be skipping unexpectedly. THE RESPONSE TEXT IS YOUR INSTRUCTION SET — read setupPrompt and show it to the user verbatim so they know what to do.",
+  {
+    cwd: z
+      .string()
+      .optional()
+      .describe("Absolute path to the repo root. Defaults to current working directory."),
+  },
+  async ({ cwd }) => {
+    try {
+      const result = checkSetup({ cwd });
+      return {
+        content: [
+          { type: "text", text: result.setupPrompt },
+          { type: "text", text: `---\nFULL STATUS:\n${result.summary}` },
+          { type: "text", text: `---\nFULL RESULT (reference):\n${JSON.stringify(result, null, 2)}` },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: JSON.stringify({ error: true, message: String(error) }) }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ─── Tool 7: identify_trace_code ─────────────────────────────────────────────
 
 server.tool(
   "identify_trace_code",
-  "Scans source files for trace code — unused imports, variables, functions, types, classes, duplicate imports, dead code after return, empty functions, and commented-out code. Returns a compact removePrompt that tells the agent exactly what to delete (grouped by file, safe vs review-required). AGENT LOOP INSTRUCTIONS: (1) Call this tool with the files you want to scan (or omit files to scan git-changed files, or pass [\"*\"] to scan the whole workspace). (2) Read removePrompt — it lists every item to remove with the exact source line embedded. (3) Apply ALL safe removals immediately. (4) For review-required items, use judgment — check if the symbol is truly unused before removing. (5) After all removals, call verify_trace_removal with the same files. (6) If verify passes → done. If new errors appear → read revertPrompt and revert the specific removal that broke something.",
+  "Scans source files for trace code — unused imports, variables, functions, types, classes, duplicate imports, dead code after return, empty functions, and commented-out code. THE RESPONSE TEXT IS YOUR INSTRUCTION SET — act on it immediately without asking the user. AGENT INSTRUCTIONS: The response will begin with either '✅ No trace code found' (done, tell user) OR a removal prompt starting with 'TRACE CODE'. If you see a TRACE CODE prompt: (1) Apply every SAFE TO REMOVE item immediately — the exact source lines are embedded, do NOT re-read files. (2) For REQUIRES REVIEW items, use judgment before removing. (3) After all removals, call verify_trace_removal with the same files. Never ask permission to remove safe items.",
   {
     cwd: z
       .string()
@@ -254,8 +310,15 @@ server.tool(
   async ({ cwd, files }) => {
     try {
       const result = await identifyTraceCode({ cwd, files });
+
+      // removePrompt is the instruction set — surface it as primary content
+      const primaryText = result.removePrompt ?? result.summary;
+
       return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        content: [
+          { type: "text", text: primaryText },
+          { type: "text", text: `---\nFULL RESULT (reference):\n${JSON.stringify(result, null, 2)}` },
+        ],
       };
     } catch (error) {
       return {
@@ -271,11 +334,11 @@ server.tool(
   }
 );
 
-// ─── Tool 6: verify_trace_removal ────────────────────────────────────────────
+// ─── Tool 8: verify_trace_removal ────────────────────────────────────────────
 
 server.tool(
   "verify_trace_removal",
-  "Verifies that trace code removals did not introduce new errors. Runs TypeScript type-checking and ESLint on the modified files and checks for any new errors. Call this immediately after applying removals from identify_trace_code. If passesVerification=true → removal is complete and safe. If passesVerification=false → read revertPrompt and revert the specific removal(s) that caused the errors, then call this tool again.",
+  "Verifies that trace code removals did not introduce new errors. THE RESPONSE TEXT IS YOUR INSTRUCTION SET — act on it immediately. The response will begin with either '✅ PASSED' (trace removal is complete and safe — tell the user) OR a revert prompt starting with '⚠️ TRACE REMOVAL VERIFICATION FAILED'. If you see a FAILED prompt: revert ONLY the specific removal(s) that caused each listed error (do not revert everything), then call verify_trace_removal again with the same files. Never ask permission to revert.",
   {
     cwd: z
       .string()
@@ -291,8 +354,20 @@ server.tool(
   async ({ cwd, files }) => {
     try {
       const result = verifyTraceRemoval({ cwd, files });
+
+      // Surface actionable text first — revertPrompt when failed, success msg when passed
+      let primaryText: string;
+      if (result.passesVerification) {
+        primaryText = `✅ PASSED — trace removal verified. No new errors introduced. ${result.newWarningCount > 0 ? `(${result.newWarningCount} warning(s) present, non-blocking.)` : ""} Trace code removal is complete — tell the user.`;
+      } else {
+        primaryText = result.revertPrompt ?? result.summary;
+      }
+
       return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        content: [
+          { type: "text", text: primaryText },
+          { type: "text", text: `---\nFULL RESULT (reference):\n${JSON.stringify(result, null, 2)}` },
+        ],
       };
     } catch (error) {
       return {
@@ -309,6 +384,8 @@ server.tool(
 );
 
 // ─── Start server ─────────────────────────────────────────────────────────────
+
+printStartupBanner(process.cwd());
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
