@@ -149,7 +149,28 @@ export interface NpmAuditCheckConfig {
   minSeverity?: "critical" | "high" | "moderate" | "low";
 }
 
+/**
+ * Repo-level credentials stored in .quality-loop.json (which is auto-gitignored).
+ * The config loader injects these into process.env at startup so all checks
+ * find them without requiring any ~/.zshrc edits.
+ */
+export interface RepoCredentials {
+  /** Groq API key — free tier, 14,400 req/day. Get one at console.groq.com/keys */
+  GROQ_API_KEY?: string;
+  ANTHROPIC_API_KEY?: string;
+  OPENAI_API_KEY?: string;
+  GEMINI_API_KEY?: string;
+  SONAR_TOKEN?: string;
+  SONAR_PROJECT_KEY?: string;
+  GITHUB_TOKEN?: string;
+}
+
 export interface QualityLoopConfig {
+  /**
+   * API keys stored at repo level — auto-injected into process.env.
+   * .quality-loop.json is added to .gitignore automatically when credentials are written.
+   */
+  credentials?: RepoCredentials;
   /** Which checks to run */
   checks: {
     eslint?: CheckConfig;

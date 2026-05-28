@@ -6,9 +6,12 @@ import { getSourceContext } from "./sourceContext.js";
 
 /**
  * Runs tsc --noEmit and parses the diagnostic output into normalized Issues.
+ * Results are filtered to only the files passed in — pre-existing errors in
+ * unrelated files are deliberately excluded so review_changed_files stays
+ * scoped to what the agent actually changed.
  */
 export function runTypecheck(
-  _files: string[],
+  files: string[],
   cwd: string,
   config: CheckConfig
 ): { issues: Issue[]; skipped: boolean; skipReason?: string } {
@@ -41,9 +44,16 @@ export function runTypecheck(
     output = [execError.stdout, execError.stderr].filter(Boolean).join("\n");
   }
 
-  const issues = parseTscOutput(output, cwd);
-  return { issues, skipped: false };
+  const allIssues = parseTscOutput(output, cwd);
 
+  // Filter to only the files being reviewed.
+  // tsc runs project-wide so it surfaces pre-existing errors in untouched files —
+  // we only want errors in the files the agent actually changed.
+  const filteredIssues = files.length > 0
+    ? allIssues.filter((issue) => filesContainPath(files, issue.path))
+    : allIssues;
+
+  return { issues: filteredIssues, skipped: false };
 }
 
 /**
@@ -102,6 +112,19 @@ function resolveTscBin(cwd: string): string | null {
     // not found
   }
   return null;
+}
+
+/**
+ * Returns true if any file in the list matches issuePath.
+ * Normalises separators and handles both relative and absolute paths.
+ */
+function filesContainPath(files: string[], issuePath: string): boolean {
+  const norm = (p: string) => p.replace(/\\/g, "/").replace(/^\.\//, "");
+  const ip = norm(issuePath);
+  return files.some((f) => {
+    const fp = norm(f);
+    return ip === fp || ip.endsWith("/" + fp) || fp.endsWith("/" + ip);
+  });
 }
 
 /** Common TypeScript error code → fix hint mapping */

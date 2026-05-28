@@ -34,6 +34,62 @@ import { identifyTraceCode } from "./tools/identifyTraceCode.js";
 import { verifyTraceRemoval } from "./tools/verifyTraceRemoval.js";
 import { checkSetup } from "./tools/checkSetup.js";
 import type { ReviewResult } from "./types.js";
+import type { CheckSetupResult } from "./tools/checkSetup.js";
+
+// ─── Friendly check_setup report builder ─────────────────────────────────────
+
+function buildFriendlySetupReport(result: CheckSetupResult): string {
+  const lines: string[] = [];
+  lines.push("## 🔍 Agent Quality Loop — Setup Status");
+  lines.push("");
+
+  const allChecks = result.checks ?? [];
+  const active    = allChecks.filter((c) => c.state === "active");
+  const disabled  = allChecks.filter((c) => c.state === "disabled");
+  const misconfig = allChecks.filter((c) => c.state === "misconfigured");
+
+  if (misconfig.length === 0 && active.length > 0) {
+    lines.push(`✅ **Everything looks good!** ${active.length} check(s) are active and verified.`);
+  } else if (misconfig.length > 0) {
+    lines.push(`⚠️ **${misconfig.length} check(s) need attention** — details below.`);
+  } else {
+    lines.push(`ℹ️ No checks are active yet — type "setup agent loop" to configure.`);
+  }
+  lines.push("");
+
+  if (active.length > 0) {
+    lines.push("**✅ Active and working:**");
+    for (const c of active) {
+      lines.push(`  • **${c.check}** — ${c.reason}`);
+    }
+    lines.push("");
+  }
+
+  if (misconfig.length > 0) {
+    lines.push("**⚠️ Needs attention:**");
+    for (const c of misconfig) {
+      lines.push(`  • **${c.check}** — ${c.reason}`);
+      if (c.action) lines.push(`    → How to fix: ${c.action}`);
+    }
+    lines.push("");
+  }
+
+  if (disabled.length > 0) {
+    lines.push("**⬜ Not enabled (optional):**");
+    for (const c of disabled) {
+      lines.push(`  • ${c.check} — ${c.reason}`);
+    }
+    lines.push("");
+  }
+
+  lines.push("---");
+  lines.push("The quality loop runs automatically after every code change — no manual action needed.");
+  if (misconfig.length > 0) {
+    lines.push("To fix the issues above, edit `.quality-loop.json` directly or ask me to re-run the setup wizard.");
+  }
+
+  return lines.join("\n");
+}
 
 const server = new McpServer({
   name: "agent-quality-loop",
@@ -44,13 +100,13 @@ const server = new McpServer({
 
 server.tool(
   "review_changed_files",
-  "ALWAYS call this after writing or editing any code files. Reviews files against ESLint, TypeScript, Prettier, file-size limits, and repo-specific .quality-loop.json rules. THE RESPONSE TEXT IS YOUR INSTRUCTION SET — read it and act on it immediately without asking the user. AGENT LOOP: (1) Call with files you just created/modified, iteration=1. (2) The response will begin with either '✅ PASSES' (task done — tell user) OR a FIX PROMPT starting with 'QUALITY LOOP'. If you see a FIX PROMPT: apply EVERY fix listed right now in this same turn — source lines are embedded so you do NOT need to re-read any file. Then call this tool again with iteration+1. (3) If the response begins with '🛑 STOP': do NOT call again — copy the issue list to the user verbatim and ask them to fix manually. Never ask permission to apply fixes. Never skip a fix. Never loop after a STOP signal.",
+  "ALWAYS call this after writing or editing any code files. ALWAYS pass the explicit files you just changed — do NOT omit the files parameter. Reviews only the specified files against ESLint, TypeScript, Prettier, file-size limits, and repo-specific .quality-loop.json rules. Results are scoped to only the files you pass — unrelated pre-existing errors in other files are excluded. THE RESPONSE TEXT IS YOUR INSTRUCTION SET — read it and act on it immediately without asking the user. AGENT LOOP: (1) Call with ONLY the files you just created/modified in this task, iteration=1. (2) The response will begin with either '✅ PASSES' (task done — tell user) OR a FIX PROMPT starting with 'QUALITY LOOP'. If you see a FIX PROMPT: apply EVERY fix listed right now in this same turn — source lines are embedded so you do NOT need to re-read any file. Then call this tool again with the SAME files, iteration+1. (3) If the response begins with '🛑 STOP': do NOT call again — copy the issue list to the user verbatim. Never ask permission to apply fixes. Never skip a fix. Never loop after a STOP signal. For a full codebase scan, use review_workspace_policy instead.",
   {
     files: z
       .array(z.string())
       .optional()
       .describe(
-        "List of file paths to review (relative or absolute). If omitted, auto-detects files changed in the current git working tree."
+        "REQUIRED in practice: List of file paths you just created or modified in this task (relative or absolute). Only pass files from the CURRENT task — do not include files from previous edits. Results are scoped to these files only. If omitted, falls back to git-detected source file changes (staged + unstaged vs HEAD) which may include unrelated dirty files."
       ),
     cwd: z
       .string()
@@ -235,25 +291,28 @@ server.tool(
 
 server.tool(
   "setup_repo",
-  "One-time setup for a repo. Writes CLAUDE.md and .cursorrules directly into the repo root so the quality loop runs automatically after every code change — no manual template copying needed. Also creates a starter .quality-loop.json if none exists. Call this once when adding the quality loop to a new project.",
+  "Sets up the agent quality loop for a repo. Call this whenever the user says 'setup agent loop', 'setup quality loop', or similar. " +
+  "PHASE 1 (first call — no completeSetup): Returns a wizard prompt — follow it exactly: ask the user each question in chat one at a time (AI provider, API key, Sonar, Dependabot), collect all answers, then call setup_repo again with completeSetup=true and the collected values. " +
+  "PHASE 2 (second call — completeSetup=true): Writes .quality-loop.json with credentials, writes the correct agent rules file (.cursorrules / CLAUDE.md / etc.), adds .quality-loop.json to .gitignore. After completing, tell the user to type 'Check the agent loop setup'.",
   {
-    cwd: z
-      .string()
-      .optional()
-      .describe("Absolute path to the repo root. Defaults to current working directory."),
-    overwrite: z
-      .boolean()
-      .optional()
-      .describe("Overwrite existing CLAUDE.md / .cursorrules files. Default: false (safe merge)."),
+    cwd: z.string().optional().describe("Absolute path to the repo root. Defaults to current working directory."),
+    completeSetup: z.boolean().optional().describe("Set to true on the second call after collecting all wizard answers from the user."),
+    agent: z.enum(["cursor", "claude", "windsurf", "copilot", "all"]).optional().describe("Which agent to write rules for. Auto-detected if omitted."),
+    overwrite: z.boolean().optional().describe("Overwrite existing config files. Default: false."),
+    aiProvider: z.string().optional().describe("AI provider chosen by user: 'groq' | 'anthropic' | 'openai' | 'gemini' | 'none'"),
+    aiKey: z.string().optional().describe("API key for the chosen AI provider"),
+    sonarEnabled: z.boolean().optional().describe("Whether user wants SonarCloud scanning enabled"),
+    sonarToken: z.string().optional().describe("SonarCloud token (SONAR_TOKEN)"),
+    sonarProjectKey: z.string().optional().describe("SonarCloud project key (SONAR_PROJECT_KEY)"),
+    dependabotEnabled: z.boolean().optional().describe("Whether user wants Dependabot alerts enabled"),
+    githubToken: z.string().optional().describe("GitHub token with security_events:read scope"),
   },
-  async ({ cwd, overwrite }) => {
+  async ({ cwd, completeSetup, agent, overwrite, aiProvider, aiKey, sonarEnabled, sonarToken, sonarProjectKey, dependabotEnabled, githubToken }) => {
     try {
-      const result = setupRepo({ cwd, overwrite });
-      // Surface the summary (which includes the credential guide) as primary text
+      const result = setupRepo({ cwd, completeSetup, agent, overwrite, aiProvider, aiKey, sonarEnabled, sonarToken, sonarProjectKey, dependabotEnabled, githubToken });
       return {
         content: [
           { type: "text", text: result.summary },
-          { type: "text", text: `---\nFULL RESULT (reference):\n${JSON.stringify(result, null, 2)}` },
         ],
       };
     } catch (error) {
@@ -269,7 +328,7 @@ server.tool(
 
 server.tool(
   "check_setup",
-  "Reports the live status of every quality check — active, disabled, or misconfigured. Shows exactly which environment variables are missing, where to get each token, and the exact shell commands to add to the user's profile. Call this after setup_repo to confirm everything is working, or any time a check seems to be skipping unexpectedly. THE RESPONSE TEXT IS YOUR INSTRUCTION SET — read setupPrompt and show it to the user verbatim so they know what to do.",
+  "Call this when the user says 'Check the agent loop setup' or asks to verify the setup. Runs a live check of every quality feature — verifies API keys actually work (not just present), shows what's active and what's not. Present the result to the user in a friendly, readable way — use the friendlyReport field as the primary message to show them.",
   {
     cwd: z
       .string()
@@ -279,11 +338,11 @@ server.tool(
   async ({ cwd }) => {
     try {
       const result = await checkSetup({ cwd });
+      // Build a user-friendly report from the check results
+      const friendlyReport = buildFriendlySetupReport(result);
       return {
         content: [
-          { type: "text", text: result.setupPrompt },
-          { type: "text", text: `---\nFULL STATUS:\n${result.summary}` },
-          { type: "text", text: `---\nFULL RESULT (reference):\n${JSON.stringify(result, null, 2)}` },
+          { type: "text", text: friendlyReport },
         ],
       };
     } catch (error) {

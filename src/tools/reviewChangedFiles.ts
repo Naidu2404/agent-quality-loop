@@ -15,8 +15,15 @@ import { loadConfig } from "../config/loader.js";
 import { stackLabel } from "../detector/techStack.js";
 import type { Issue, ReviewResult } from "../types.js";
 
+/** Source file extensions that are in-scope for per-file code review. */
+const SOURCE_EXTS = /\.(ts|tsx|js|jsx|mjs|cjs|vue|svelte|css|scss|sass|less|html|py|rb|go|rs|java|kt|swift)$/;
+
 export interface ReviewChangedFilesInput {
-  /** Absolute or relative file paths to review. If omitted, auto-detects git-changed files. */
+  /**
+   * File paths to review (relative or absolute).
+   * ALWAYS pass these explicitly — omitting falls back to git-detected changes
+   * which may include unrelated dirty files from previous work.
+   */
   files?: string[];
   /** Working directory (repo root). Defaults to process.cwd(). */
   cwd?: string;
@@ -39,6 +46,7 @@ export async function reviewChangedFiles(
   const { config, configPath, stackInfo } = loadConfig(cwd);
 
   // Resolve file list
+  const filesExplicit = (input.files ?? []).length > 0;
   let files: string[] = input.files ?? [];
   if (files.length === 0) {
     files = getGitChangedFiles(cwd);
@@ -133,31 +141,43 @@ export async function reviewChangedFiles(
   }
 
   // npm audit (known CVEs in dependencies)
+  // These are whole-repo checks — their issues are always advisory in review_changed_files
+  // so they never block a per-file fix loop. Use review_workspace_policy for blocking dep checks.
   if (config.checks.npmAudit?.enabled) {
     const auditResult = runNpmAudit(cwd, config.checks.npmAudit);
     if (auditResult.skipped) {
       checksSkipped.push({ check: "npmAudit", reason: auditResult.skipReason ?? "skipped" });
     } else {
       checksRun.push("npmAudit");
-      allIssues.push(...auditResult.issues);
+      // Force to warning so they never block the file-level loop
+      allIssues.push(...auditResult.issues.map((i) => ({ ...i, severity: "warning" as const })));
     }
   }
 
-  // GitHub Dependabot alerts
+  // GitHub Dependabot alerts — same: advisory only in review_changed_files
   if (config.checks.dependabot?.enabled) {
     const dependabotResult = await runDependabotCheck(cwd, config.checks.dependabot);
     if (dependabotResult.skipped) {
       checksSkipped.push({ check: "dependabot", reason: dependabotResult.skipReason ?? "skipped" });
     } else {
       checksRun.push("dependabot");
-      allIssues.push(...dependabotResult.issues);
+      allIssues.push(...dependabotResult.issues.map((i) => ({ ...i, severity: "warning" as const })));
     }
   }
 
+  // ── Scope filter ──────────────────────────────────────────────────────────
+  // When files were explicitly passed, restrict issues to those files only.
+  // This prevents pre-existing errors in unrelated files (from other open branches,
+  // prior edits, or project-wide tsc errors) from polluting a per-change review.
+  // Package-level issues (npmAudit/dependabot) have no file path so they always pass through.
+  const scopedIssues = filesExplicit
+    ? allIssues.filter((i) => !i.path || filesContainPath(files, i.path))
+    : allIssues;
+
   // Compute summary
   const blockingSeverities = config.blockingseverities ?? ["error"];
-  const blockingIssues = allIssues.filter((i) => blockingSeverities.includes(i.severity));
-  const advisoryIssues = allIssues.filter((i) => !blockingSeverities.includes(i.severity));
+  const blockingIssues = scopedIssues.filter((i) => blockingSeverities.includes(i.severity));
+  const advisoryIssues = scopedIssues.filter((i) => !blockingSeverities.includes(i.severity));
   const passesPolicy = blockingIssues.length === 0;
 
   const maxIterations = config.maxIterations ?? 3;
@@ -169,7 +189,7 @@ export async function reviewChangedFiles(
     files,
     checksRun,
     checksSkipped,
-    allIssues,
+    allIssues: scopedIssues,
     blockingIssues,
     advisoryIssues,
     passesPolicy,
@@ -184,54 +204,60 @@ export async function reviewChangedFiles(
     : buildFixPrompt(blockingIssues, advisoryIssues, files, iteration, maxIterations);
 
   return {
-    totalIssues: allIssues.length,
+    totalIssues: scopedIssues.length,
     blockingCount: blockingIssues.length,
     advisoryCount: advisoryIssues.length,
     passesPolicy,
     fixPrompt,
     iterationCapReached,
     iteration,
-    issues: allIssues,
+    issues: scopedIssues,
     summary,
     checksRun,
     checksSkipped,
   };
 }
 
+/**
+ * Fallback file detection when the agent doesn't pass explicit files.
+ *
+ * Only returns files that differ from HEAD (staged + unstaged tracked changes).
+ * Deliberately EXCLUDES untracked files — those may belong to completely unrelated
+ * work-in-progress and would cause false positives from other features.
+ * Also filters to source file extensions — config files like .zshrc or mcp.json
+ * edited by the agent during setup are excluded.
+ */
 function getGitChangedFiles(cwd: string): string[] {
   try {
-    // Staged + unstaged changes against HEAD
-    const staged = execSync("git diff --name-only --cached", {
-      cwd,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-    })
-      .split("\n")
-      .map((f) => f.trim())
-      .filter(Boolean);
+    const splitLines = (out: string) =>
+      out.split("\n").map((f) => f.trim()).filter(Boolean);
 
-    const unstaged = execSync("git diff --name-only", {
-      cwd,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-    })
-      .split("\n")
-      .map((f) => f.trim())
-      .filter(Boolean);
+    const staged = splitLines(
+      execSync("git diff --name-only --cached", { cwd, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] })
+    );
+    const unstaged = splitLines(
+      execSync("git diff --name-only", { cwd, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] })
+    );
 
-    const untracked = execSync("git ls-files --others --exclude-standard", {
-      cwd,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-    })
-      .split("\n")
-      .map((f) => f.trim())
-      .filter(Boolean);
-
-    return [...new Set([...staged, ...unstaged, ...untracked])];
+    // NOTE: untracked files intentionally omitted — they are too broad and include
+    // files from unrelated features / work-in-progress.
+    return [...new Set([...staged, ...unstaged])].filter((f) => SOURCE_EXTS.test(f));
   } catch {
     return [];
   }
+}
+
+/**
+ * Returns true if the files list contains a path that matches issuePath.
+ * Normalises separators and handles both relative and absolute variants.
+ */
+function filesContainPath(files: string[], issuePath: string): boolean {
+  const norm = (p: string) => p.replace(/\\/g, "/").replace(/^\.\//, "");
+  const ip = norm(issuePath);
+  return files.some((f) => {
+    const fp = norm(f);
+    return ip === fp || ip.endsWith("/" + fp) || fp.endsWith("/" + ip);
+  });
 }
 
 /**
