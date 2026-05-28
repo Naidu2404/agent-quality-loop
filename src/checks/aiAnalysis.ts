@@ -48,6 +48,40 @@ const DEFAULT_MODELS: Record<AiProvider, string> = {
 
 const DEFAULT_MAX_FILE_KB = 40;
 
+// Groq free tier: llama-3.1-8b-instant has ~8K token context window.
+// ~1 token per 4 chars — keep total prompt under 28K chars (~7K tokens) to leave room for output.
+const GROQ_SAFE_PROMPT_CHARS = 28_000;
+
+/**
+ * High-risk patterns that warrant targeted AI analysis even when the file is too large
+ * to send in full. Each pattern captures dangerous constructs that AI should see in context.
+ */
+const HIGH_RISK_PATTERNS: RegExp[] = [
+  /\beval\s*\(/,
+  /new\s+Function\s*\(/,
+  /innerHTML\s*=/,
+  /outerHTML\s*=/,
+  /document\.write\s*\(/,
+  /dangerouslySetInnerHTML/,
+  /v-html\s*=/,
+  /\bexec\s*\(/,
+  /child_process/,
+  /\.query\s*\(\s*[`'"].*\$\{/,            // template-literal SQL
+  /require\s*\(\s*[^'"]/,                   // dynamic require
+  /Math\.random\s*\(\s*\).*(?:token|secret|key|password|salt)/i,
+  // Hardcoded credentials — name-based
+  /(?:password|passwd|secret|api[_\-]?key|apikey|token|auth[_\-]?token|credential|private[_\-]?key|access[_\-]?key|client[_\-]?secret|bearer)\s*[:=]\s*['"`][^'"`\s]{8,}/i,
+  // Hardcoded credentials — value-based (known API key patterns)
+  /['"`](?:sk-[a-zA-Z0-9]{20,}|sk-ant-|gsk_[a-zA-Z0-9]{20,}|gh[pors]_[a-zA-Z0-9]{20,}|npm_[a-zA-Z0-9]{20,}|AKIA[A-Z0-9]{16}|AIza[0-9A-Za-z\-_]{20,}|xox[baprs]-|sk_live_|pk_live_)/,
+  /\bmd5\b|\bsha1\b/i,
+  /crypto\.createHash\s*\(\s*['"](?:md5|sha1)['"]/,
+  /res\.redirect\s*\(.*req\./,
+  /window\.location\s*=.*(?:req\.|query\.|params\.)/,
+  /JSON\.parse\s*\(.*req\./,
+  /prototype\[/,
+  /\.__proto__\s*=/,
+];
+
 export async function runAiAnalysis(
   files: string[],
   cwd: string,
@@ -103,7 +137,24 @@ export async function runAiAnalysis(
   }
 
   const systemPrompt = buildSystemPrompt();
-  const userPrompt = buildUserPrompt(fileContents, focus);
+
+  // Apply smart chunking for Groq (token-limited free tier)
+  const optimisedContents = buildFileContentsForPrompt(
+    fileContents,
+    systemPrompt,
+    focus,
+    provider === "groq"
+  );
+
+  if (optimisedContents.length === 0) {
+    return {
+      issues: [],
+      skipped: true,
+      skipReason: "AI analysis skipped: files are too large and contain no high-risk patterns (safe to proceed)",
+    };
+  }
+
+  const userPrompt = buildUserPrompt(optimisedContents, focus);
 
   try {
     let responseText: string;
@@ -140,10 +191,53 @@ export async function runAiAnalysis(
 
     return { issues, skipped: false, providerUsed: `${provider}/${model}` };
   } catch (err) {
+    const errMsg = String(err);
+
+    // Groq 413: payload still too large even after chunking — retry with risk-only snippets
+    if (provider === "groq" && (errMsg.includes("413") || errMsg.includes("413-payload-too-large"))) {
+      try {
+        const riskOnly = fileContents
+          .map((fc) => {
+            const s = extractRiskSnippets(fc.content, fc.path, 8);
+            return s ? { path: fc.path, content: s } : null;
+          })
+          .filter(Boolean) as { path: string; content: string }[];
+
+        if (riskOnly.length === 0) {
+          return {
+            issues: [],
+            skipped: true,
+            skipReason: "AI analysis skipped: files exceed token limit and no high-risk patterns detected",
+          };
+        }
+
+        const fallbackPrompt = buildUserPrompt(riskOnly, focus);
+        const responseText = await callGroq(model, systemPrompt, fallbackPrompt);
+        const aiIssues = parseAiResponse(responseText);
+        const issues: Issue[] = aiIssues.map((ai) => ({
+          path: ai.path,
+          line: ai.line ?? 1,
+          severity: ai.severity ?? "warning",
+          category: mapCategory(ai.category),
+          ruleId: ai.ruleId ?? "ai/unknown",
+          message: ai.message,
+          fixHint: ai.fixHint,
+          sourceLine: getSourceLine(ai.path, cwd, ai.line ?? 1),
+        }));
+        return { issues, skipped: false, providerUsed: `${provider}/${model} (risk-scan)` };
+      } catch (retryErr) {
+        return {
+          issues: [],
+          skipped: true,
+          skipReason: `AI analysis failed after risk-scan retry (${provider}/${model}): ${String(retryErr).slice(0, 200)}`,
+        };
+      }
+    }
+
     return {
       issues: [],
       skipped: true,
-      skipReason: `AI analysis failed (${provider}/${model}): ${String(err).slice(0, 200)}`,
+      skipReason: `AI analysis failed (${provider}/${model}): ${errMsg.slice(0, 200)}`,
     };
   }
 }
@@ -284,7 +378,7 @@ async function callGroq(model: string, system: string, user: string): Promise<st
 
   if (!response.ok) {
     const err = await response.text();
-    throw new Error(`Groq API ${response.status}: ${err.slice(0, 200)}`);
+    throw new Error(`Groq API ${response.status}: ${err.slice(0, 200)}${response.status === 413 ? " [413-payload-too-large]" : ""}`);
   }
 
   const data = await response.json() as { choices: { message: { content: string } }[] };
@@ -336,6 +430,111 @@ async function callOllama(
 
   const data = await response.json() as { message: { content: string } };
   return data.message?.content ?? "[]";
+}
+
+// ─── Smart chunking helpers ───────────────────────────────────────────────────
+
+/** Rough token estimate: 1 token ≈ 4 chars */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+/**
+ * Extracts lines around every HIGH_RISK_PATTERNS match with `contextLines` of context.
+ * Returns a condensed version of the file that focuses on dangerous code sections.
+ * If no patterns match, returns null (caller should send full/truncated file instead).
+ */
+function extractRiskSnippets(
+  content: string,
+  filePath: string,
+  contextLines = 12
+): string | null {
+  const lines = content.split("\n");
+  const matchedLineNums = new Set<number>();
+
+  for (let i = 0; i < lines.length; i++) {
+    for (const pattern of HIGH_RISK_PATTERNS) {
+      if (pattern.test(lines[i])) {
+        // Add context window around the match
+        for (
+          let j = Math.max(0, i - contextLines);
+          j <= Math.min(lines.length - 1, i + contextLines);
+          j++
+        ) {
+          matchedLineNums.add(j);
+        }
+        break; // one pattern match per line is enough
+      }
+    }
+  }
+
+  if (matchedLineNums.size === 0) return null;
+
+  // Build snippet: emit numbered lines, insert "..." between gaps
+  const sortedNums = [...matchedLineNums].sort((a, b) => a - b);
+  const snippetLines: string[] = [
+    `// [SMART SCAN: showing ${sortedNums.length}/${lines.length} lines matching high-risk patterns]`,
+  ];
+  let prev = -2;
+  for (const num of sortedNums) {
+    if (num > prev + 1) snippetLines.push(`// ... (lines ${prev + 2}–${num} omitted)`);
+    snippetLines.push(`${num + 1}: ${lines[num]}`);
+    prev = num;
+  }
+  if (prev < lines.length - 1) {
+    snippetLines.push(`// ... (lines ${prev + 2}–${lines.length} omitted)`);
+  }
+
+  return snippetLines.join("\n");
+}
+
+/**
+ * Builds file content array, switching to risk-snippet mode for files that would
+ * push the total prompt over the Groq-safe limit.
+ */
+function buildFileContentsForPrompt(
+  fileContents: { path: string; content: string }[],
+  systemPrompt: string,
+  focus: string[],
+  isGroq: boolean
+): { path: string; content: string }[] {
+  if (!isGroq) return fileContents; // other providers have higher limits
+
+  const systemTokens = estimateTokens(systemPrompt);
+  const focusTokens = estimateTokens(buildFocusInstructions(focus));
+  const overhead = systemTokens + focusTokens + 200; // header/footer overhead
+
+  let budgetChars = GROQ_SAFE_PROMPT_CHARS - overhead * 4;
+  const result: { path: string; content: string }[] = [];
+
+  for (const fc of fileContents) {
+    const fullChars = fc.content.length + fc.path.length + 20; // "=== FILE: ... ===\n"
+
+    if (fullChars <= budgetChars) {
+      result.push(fc);
+      budgetChars -= fullChars;
+    } else {
+      // File is too large — try risk-snippet mode first
+      const snippets = extractRiskSnippets(fc.content, fc.path);
+      if (snippets !== null) {
+        const snippetChars = snippets.length + fc.path.length + 20;
+        if (snippetChars <= budgetChars) {
+          result.push({ path: fc.path, content: snippets });
+          budgetChars -= snippetChars;
+        } else {
+          // Even snippets are too large — truncate the snippets
+          const truncated = snippets.slice(0, budgetChars - fc.path.length - 20);
+          result.push({ path: fc.path, content: truncated + "\n// [TRUNCATED]" });
+          budgetChars = 0;
+        }
+      }
+      // If no high-risk patterns found in oversized file, skip it (clean bill of health for risky patterns)
+    }
+
+    if (budgetChars <= 0) break;
+  }
+
+  return result;
 }
 
 // ─── Prompt builders ──────────────────────────────────────────────────────────

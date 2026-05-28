@@ -3,6 +3,24 @@ import type { CustomRule, QualityLoopConfig, TechStack } from "../types.js";
 /** Default custom rules that apply to every project */
 const universalRules: CustomRule[] = [
   {
+    id: "no-eval",
+    description: "Disallow eval() — code injection risk",
+    severity: "error",
+    pattern: "\\beval\\s*\\(",
+    message: "eval() detected — this allows arbitrary code execution and is a critical security vulnerability.",
+    fixHint: "Remove eval(). Use JSON.parse() for data, or refactor to avoid dynamic code execution.",
+    glob: "**/*.{js,ts,jsx,tsx,vue,mjs,cjs}",
+  },
+  {
+    id: "no-new-function",
+    description: "Disallow new Function() — code injection risk",
+    severity: "error",
+    pattern: "new\\s+Function\\s*\\(",
+    message: "new Function() is equivalent to eval() — it allows dynamic code execution.",
+    fixHint: "Refactor to use a static function or data-driven approach instead of new Function().",
+    glob: "**/*.{js,ts,jsx,tsx,vue,mjs,cjs}",
+  },
+  {
     id: "no-debug-console",
     description: "No console.log / console.debug left in code",
     severity: "warning",
@@ -22,13 +40,28 @@ const universalRules: CustomRule[] = [
   },
   {
     id: "no-hardcoded-secrets",
-    description: "Detect obvious hardcoded secrets/tokens",
+    description: "Detect hardcoded secrets/tokens by variable or property name",
     severity: "error",
+    // Matches assignments AND object property colon syntax (both = and :)
+    // Covers camelCase (apiKey), snake_case (api_key), SCREAMING (API_KEY), and standalone "key"
     pattern:
-      "(password|secret|api_key|apikey|token|auth_token)\\s*=\\s*['\"][^'\"]{6,}['\"]",
-    message: "Possible hardcoded secret detected.",
-    fixHint: "Move secrets to environment variables or a secrets manager.",
-    glob: "**/*.{js,ts,jsx,tsx,vue,py,java,go,env}",
+      "(?:password|passwd|secret|(?<![a-z])key(?![a-z])|api[_\\-]?key|apikey|token|auth[_\\-]?token|credential|private[_\\-]?key|access[_\\-]?key|client[_\\-]?secret|bearer)\\s*[:=]\\s*['\"`][^'\"`\\s]{16,}['\"`]",
+    message: "Possible hardcoded secret detected — credential stored as a literal string.",
+    fixHint: "Move to an environment variable (process.env.KEY) or a secrets manager. Never commit credentials.",
+    glob: "**/*.{js,ts,jsx,tsx,vue,py,java,go,rb,php,yaml,yml,json,env}",
+  },
+  {
+    id: "no-api-key-literal",
+    description: "Detect real API key string patterns (value-based detection)",
+    severity: "error",
+    // Catches known API key formats by their VALUE pattern, regardless of variable name.
+    // Covers: OpenAI (sk-), Anthropic (sk-ant-), Groq (gsk_), GitHub PAT (ghp_/gho_/ghs_),
+    //         npm (npm_), AWS (AKIA), Google (AIza), Slack (xoxb-/xoxp-), Stripe (sk_live_/pk_live_)
+    pattern:
+      "(?:['\"`](?:sk-[a-zA-Z0-9_\\-]{20,}|gsk_[a-zA-Z0-9]{30,}|gh[pors]_[a-zA-Z0-9]{15,}|npm_[a-zA-Z0-9]{20,}|AKIA[A-Z0-9]{16}|AIza[0-9A-Za-z\\-_]{30,}|xox[baprs]-[a-zA-Z0-9\\-]{10,}|sk_live_[a-zA-Z0-9]{20,}|pk_live_[a-zA-Z0-9]{20,}|ya29\\.[a-zA-Z0-9_\\-]{30,})['\"`]|Bearer\\s+(?:gh[pors]_[a-zA-Z0-9]{15,}|sk-[a-zA-Z0-9_\\-]{20,}|[a-zA-Z0-9_\\-\\.]{40,}))",
+    message: "Real API key / token literal detected in source code.",
+    fixHint: "Remove this key immediately, revoke it at the provider, and replace with process.env.KEY. Rotate if already committed.",
+    glob: "**/*.{js,ts,jsx,tsx,vue,py,java,go,rb,php,yaml,yml,json,env,md}",
   },
 ];
 

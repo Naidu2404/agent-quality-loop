@@ -78,14 +78,17 @@ async function verifySonarToken(
   token: string,
   serverUrl: string
 ): Promise<{ ok: boolean; error?: string }> {
+  // SonarCloud/SonarQube uses HTTP Basic auth — token as username, empty password.
+  // Bearer auth is NOT accepted by /api/authentication/validate and returns valid:false.
+  const basicCredentials = Buffer.from(`${token}:`).toString("base64");
   try {
     const res = await fetch(`${serverUrl}/api/authentication/validate`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { Authorization: `Basic ${basicCredentials}` },
       signal: AbortSignal.timeout(8000),
     });
-    if (res.status === 401) return { ok: false, error: "Token rejected — regenerate at sonarcloud.io/account/security" };
+    if (res.status === 401) return { ok: false, error: "Token rejected (401) — regenerate at sonarcloud.io/account/security" };
     const data = await res.json() as { valid?: boolean };
-    if (data.valid === false) return { ok: false, error: "Token is present but SonarCloud reports it as invalid" };
+    if (data.valid === false) return { ok: false, error: "SonarCloud reports token as invalid — regenerate at sonarcloud.io/account/security" };
     return { ok: true };
   } catch {
     return { ok: false, error: `Could not reach ${serverUrl} — check network or server URL` };
@@ -267,7 +270,7 @@ export async function checkSetup(input: CheckSetupInput): Promise<CheckSetupResu
       checks.push({
         check: "sonar", state: "misconfigured", enabledInConfig: true,
         reason: `SONAR_TOKEN present but verification failed: ${sonarVerify.error}`,
-        action: `1. Go to ${serverUrl}/account/security\n   2. Revoke the old token and generate a new one\n   3. export SONAR_TOKEN="sqp_..."\n   4. source ~/.zshrc`,
+        action: `1. Go to ${serverUrl}/account/security and generate a new token\n   2. Update the SONAR_TOKEN value in .quality-loop.json under "credentials"`,
       });
     }
   }

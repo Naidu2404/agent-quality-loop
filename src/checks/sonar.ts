@@ -80,9 +80,11 @@ export async function runSonarCheck(
       if (organization) params.set("organization", organization);
 
       const url = `${serverUrl}/api/issues/search?${params}`;
+      // SonarCloud uses HTTP Basic auth: token as username, empty password
+      const basicCredentials = Buffer.from(`${token}:`).toString("base64");
       const response = await fetch(url, {
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: `Basic ${basicCredentials}`,
           Accept: "application/json",
         },
       });
