@@ -16,6 +16,101 @@ import { execSync } from "child_process";
 import { loadConfig } from "../config/loader.js";
 import { stackLabel } from "../detector/techStack.js";
 
+// ─── Live API verifiers ───────────────────────────────────────────────────────
+
+async function verifyAiKey(
+  provider: string,
+  key: string
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    if (provider === "anthropic") {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: 1, messages: [{ role: "user", content: "hi" }] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (res.status === 401) return { ok: false, error: "Invalid API key — check the key and try again" };
+      return { ok: res.ok || res.status === 529 }; // 529 = overloaded but key is valid
+    }
+
+    if (provider === "openai") {
+      const res = await fetch("https://api.openai.com/v1/models", {
+        headers: { Authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (res.status === 401) return { ok: false, error: "Invalid API key" };
+      return { ok: res.ok };
+    }
+
+    if (provider === "gemini") {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${key}`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      if (res.status === 400 || res.status === 403) return { ok: false, error: "Invalid API key" };
+      return { ok: res.ok };
+    }
+
+    if (provider === "groq") {
+      const res = await fetch("https://api.groq.com/openai/v1/models", {
+        headers: { Authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (res.status === 401) return { ok: false, error: "Invalid API key" };
+      return { ok: res.ok };
+    }
+
+    if (provider === "ollama") {
+      const res = await fetch("http://localhost:11434/api/tags", {
+        signal: AbortSignal.timeout(3000),
+      });
+      return { ok: res.ok, error: res.ok ? undefined : "Ollama is not running — start with: ollama serve" };
+    }
+
+    return { ok: true };
+  } catch {
+    return { ok: false, error: `Could not reach ${provider} API — check network connection` };
+  }
+}
+
+async function verifySonarToken(
+  token: string,
+  serverUrl: string
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${serverUrl}/api/authentication/validate`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.status === 401) return { ok: false, error: "Token rejected — regenerate at sonarcloud.io/account/security" };
+    const data = await res.json() as { valid?: boolean };
+    if (data.valid === false) return { ok: false, error: "Token is present but SonarCloud reports it as invalid" };
+    return { ok: true };
+  } catch {
+    return { ok: false, error: `Could not reach ${serverUrl} — check network or server URL` };
+  }
+}
+
+async function verifyGithubToken(
+  token: string
+): Promise<{ ok: boolean; error?: string; rateLimit?: string }> {
+  try {
+    const res = await fetch("https://api.github.com/rate_limit", {
+      headers: { Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": "2022-11-28" },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.status === 401) return { ok: false, error: "Invalid token — regenerate at github.com/settings/tokens" };
+    if (res.status === 403) return { ok: false, error: "Token lacks required permissions (need: security_events: read)" };
+    const data = await res.json() as { resources?: { core?: { remaining: number; limit: number } } };
+    const core = data.resources?.core;
+    const rateLimit = core ? `${core.remaining}/${core.limit} requests remaining` : undefined;
+    return { ok: res.ok, rateLimit };
+  } catch {
+    return { ok: false, error: "Could not reach api.github.com — check network connection" };
+  }
+}
+
 export interface CheckSetupInput {
   /** Absolute path to the repo root. Defaults to process.cwd(). */
   cwd?: string;
@@ -39,7 +134,7 @@ export interface CheckSetupResult {
   summary: string;
 }
 
-export function checkSetup(input: CheckSetupInput): CheckSetupResult {
+export async function checkSetup(input: CheckSetupInput): Promise<CheckSetupResult> {
   const cwd = input.cwd ?? process.cwd();
   const { config, configPath, stackInfo } = loadConfig(cwd);
 
@@ -115,19 +210,18 @@ export function checkSetup(input: CheckSetupInput): CheckSetupResult {
         'Add to .quality-loop.json checks:',
         '"ai": { "enabled": true, "focus": ["security","sonar","dependencies"] }',
         '',
-        'Then set ONE of these environment variables depending on which service you use:',
-        '  Anthropic (Claude) → export ANTHROPIC_API_KEY="sk-ant-..."   https://console.anthropic.com/settings/keys',
-        '  OpenAI             → export OPENAI_API_KEY="sk-..."           https://platform.openai.com/api-keys',
-        '  Google Gemini      → export GEMINI_API_KEY="AIza..."          https://aistudio.google.com/app/apikey',
-        '  Ollama (local)     → set provider: "ollama" — no key needed, run: ollama pull llama3.2',
-        '',
-        'The provider is auto-detected from whichever key you set (or set checks.ai.provider explicitly).',
+        'Then set an API key (Groq is free — recommended):',
+        '  export GROQ_API_KEY="gsk_..."         # https://console.groq.com/keys (free tier)',
+        '  export ANTHROPIC_API_KEY="sk-ant-..."  # https://console.anthropic.com/settings/keys',
+        '  export OPENAI_API_KEY="sk-..."          # https://platform.openai.com/api-keys',
+        '  export GEMINI_API_KEY="AIza..."         # https://aistudio.google.com/app/apikey (free)',
+        '  — or run: npx agent-quality-loop --configure',
       ].join('\n'),
     });
   } else {
-    const aiStatus = resolveAiStatus(aiProvider);
+    const aiStatus = await resolveAiStatus(aiProvider);
     checks.push({
-      check: `ai (security + sonar-style) [${aiStatus.resolvedProvider ?? "auto-detect"}]`,
+      check: `ai [${aiStatus.resolvedProvider ?? "built-in ollama"}]`,
       state: aiStatus.state,
       enabledInConfig: true,
       reason: aiStatus.reason,
@@ -166,7 +260,16 @@ export function checkSetup(input: CheckSetupInput): CheckSetupResult {
     });
   } else {
     const serverUrl = config.checks.sonar?.serverUrl ?? "https://sonarcloud.io";
-    checks.push({ check: "sonar", state: "active", enabledInConfig: true, reason: `SONAR_TOKEN present, project key configured — fetching from ${serverUrl}` });
+    const sonarVerify = await verifySonarToken(process.env.SONAR_TOKEN!, serverUrl);
+    if (sonarVerify.ok) {
+      checks.push({ check: "sonar", state: "active", enabledInConfig: true, reason: `✓ Token verified — connected to ${serverUrl}` });
+    } else {
+      checks.push({
+        check: "sonar", state: "misconfigured", enabledInConfig: true,
+        reason: `SONAR_TOKEN present but verification failed: ${sonarVerify.error}`,
+        action: `1. Go to ${serverUrl}/account/security\n   2. Revoke the old token and generate a new one\n   3. export SONAR_TOKEN="sqp_..."\n   4. source ~/.zshrc`,
+      });
+    }
   }
 
   // ── npm audit ───────────────────────────────────────────────────────────────
@@ -219,7 +322,17 @@ export function checkSetup(input: CheckSetupInput): CheckSetupResult {
       action: '1. Go to https://github.com/settings/tokens (Fine-grained tokens → New token)\n   2. Set permissions: Security events = Read-only\n   3. Add to shell profile: export GITHUB_TOKEN="github_pat_..."\n   4. Restart your terminal\n   Note: In GitHub Actions, use ${{ secrets.GITHUB_TOKEN }} — no setup needed.',
     });
   } else {
-    checks.push({ check: "dependabot", state: "active", enabledInConfig: true, reason: "GITHUB_TOKEN present — will fetch open Dependabot alerts from GitHub" });
+    const ghVerify = await verifyGithubToken(process.env.GITHUB_TOKEN!);
+    if (ghVerify.ok) {
+      const rl = ghVerify.rateLimit ? ` (${ghVerify.rateLimit})` : "";
+      checks.push({ check: "dependabot", state: "active", enabledInConfig: true, reason: `✓ Token verified — connected to GitHub API${rl}` });
+    } else {
+      checks.push({
+        check: "dependabot", state: "misconfigured", enabledInConfig: true,
+        reason: `GITHUB_TOKEN present but verification failed: ${ghVerify.error}`,
+        action: '1. Go to https://github.com/settings/tokens → Fine-grained tokens → New token\n   2. Set permissions: Security events = Read-only\n   3. export GITHUB_TOKEN="github_pat_..."\n   4. source ~/.zshrc',
+      });
+    }
   }
 
   // ── Compute totals ──────────────────────────────────────────────────────────
@@ -322,76 +435,101 @@ function buildSummary(
 
 // ─── AI provider status helper ────────────────────────────────────────────────
 
-function resolveAiStatus(configuredProvider?: string): {
+async function resolveAiStatus(configuredProvider?: string): Promise<{
   state: "active" | "misconfigured";
   resolvedProvider: string | null;
   reason: string;
   action?: string;
-} {
-  // If a provider is explicitly configured, check only that one
+}> {
+  // Helper: verify + build result for a key-based provider
+  async function checkKeyed(
+    provider: "anthropic" | "openai" | "gemini" | "groq",
+    envVar: string,
+    label: string,
+    link: string,
+    exportExample: string
+  ) {
+    const key = process.env[envVar];
+    if (!key) {
+      return {
+        state: "misconfigured" as const, resolvedProvider: provider,
+        reason: `provider set to "${provider}" but ${envVar} is not in environment`,
+        action: `1. Get your key at ${link}\n   2. export ${envVar}="${exportExample}"\n   3. source ~/.zshrc`,
+      };
+    }
+    const v = await verifyAiKey(provider, key);
+    if (!v.ok) {
+      return {
+        state: "misconfigured" as const, resolvedProvider: provider,
+        reason: `${envVar} is set but API rejected it: ${v.error}`,
+        action: `1. Get a new key at ${link}\n   2. export ${envVar}="${exportExample}"\n   3. source ~/.zshrc`,
+      };
+    }
+    return { state: "active" as const, resolvedProvider: provider, reason: `✓ ${envVar} verified — ${label} ready` };
+  }
+
+  // Explicitly configured provider
   if (configuredProvider) {
-    switch (configuredProvider) {
-      case "anthropic":
-        if (process.env.ANTHROPIC_API_KEY) {
-          return { state: "active", resolvedProvider: "anthropic", reason: "ANTHROPIC_API_KEY present — Claude Haiku will analyse on iteration 1" };
-        }
-        return {
-          state: "misconfigured", resolvedProvider: "anthropic",
-          reason: 'provider set to "anthropic" but ANTHROPIC_API_KEY is not in environment',
-          action: '1. Get your key at https://console.anthropic.com/settings/keys\n   2. export ANTHROPIC_API_KEY="sk-ant-..."\n   3. source ~/.zshrc',
-        };
-
-      case "openai":
-        if (process.env.OPENAI_API_KEY) {
-          return { state: "active", resolvedProvider: "openai", reason: "OPENAI_API_KEY present — GPT-4o-mini will analyse on iteration 1" };
-        }
-        return {
-          state: "misconfigured", resolvedProvider: "openai",
-          reason: 'provider set to "openai" but OPENAI_API_KEY is not in environment',
-          action: '1. Get your key at https://platform.openai.com/api-keys\n   2. export OPENAI_API_KEY="sk-..."\n   3. source ~/.zshrc',
-        };
-
-      case "gemini":
-        if (process.env.GEMINI_API_KEY) {
-          return { state: "active", resolvedProvider: "gemini", reason: "GEMINI_API_KEY present — Gemini 1.5 Flash will analyse on iteration 1" };
-        }
-        return {
-          state: "misconfigured", resolvedProvider: "gemini",
-          reason: 'provider set to "gemini" but GEMINI_API_KEY is not in environment',
-          action: '1. Get your key at https://aistudio.google.com/app/apikey\n   2. export GEMINI_API_KEY="AIza..."\n   3. source ~/.zshrc',
-        };
-
-      case "ollama":
-        return {
-          state: "active", resolvedProvider: "ollama",
-          reason: 'Using Ollama (local) — no API key needed. Ensure Ollama is running: ollama serve',
-        };
+    if (configuredProvider === "anthropic") {
+      return checkKeyed("anthropic", "ANTHROPIC_API_KEY", "Claude Haiku", "https://console.anthropic.com/settings/keys", "sk-ant-...");
+    }
+    if (configuredProvider === "openai") {
+      return checkKeyed("openai", "OPENAI_API_KEY", "GPT-4o-mini", "https://platform.openai.com/api-keys", "sk-...");
+    }
+    if (configuredProvider === "gemini") {
+      return checkKeyed("gemini", "GEMINI_API_KEY", "Gemini 1.5 Flash", "https://aistudio.google.com/app/apikey", "AIza...");
+    }
+    if (configuredProvider === "groq") {
+      return checkKeyed("groq", "GROQ_API_KEY", "Groq llama-3.1-8b-instant", "https://console.groq.com/keys", "gsk_...");
+    }
+    if (configuredProvider === "ollama") {
+      const v = await verifyAiKey("ollama", "");
+      return {
+        state: v.ok ? "active" : "misconfigured",
+        resolvedProvider: "ollama",
+        reason: v.ok
+          ? "✓ Ollama is running locally — llama3.2 will be used"
+          : "Ollama not running — start it with: ollama serve",
+        action: v.ok ? undefined : "1. Install Ollama: https://ollama.com/download\n   2. Run: ollama pull llama3.2\n   3. Run: ollama serve",
+      };
     }
   }
 
-  // Auto-detect from environment
+  // Auto-detect: try each key in priority order, live-verify each one
   if (process.env.ANTHROPIC_API_KEY) {
-    return { state: "active", resolvedProvider: "anthropic (auto-detected)", reason: "ANTHROPIC_API_KEY found — Claude Haiku will be used" };
+    const v = await verifyAiKey("anthropic", process.env.ANTHROPIC_API_KEY);
+    if (v.ok) return { state: "active", resolvedProvider: "anthropic (auto-detected)", reason: "✓ ANTHROPIC_API_KEY verified — Claude Haiku will be used" };
+    return { state: "misconfigured", resolvedProvider: "anthropic", reason: `ANTHROPIC_API_KEY set but invalid: ${v.error}`, action: "Get a new key at https://console.anthropic.com/settings/keys" };
   }
   if (process.env.OPENAI_API_KEY) {
-    return { state: "active", resolvedProvider: "openai (auto-detected)", reason: "OPENAI_API_KEY found — GPT-4o-mini will be used" };
+    const v = await verifyAiKey("openai", process.env.OPENAI_API_KEY);
+    if (v.ok) return { state: "active", resolvedProvider: "openai (auto-detected)", reason: "✓ OPENAI_API_KEY verified — GPT-4o-mini will be used" };
+    return { state: "misconfigured", resolvedProvider: "openai", reason: `OPENAI_API_KEY set but invalid: ${v.error}`, action: "Get a new key at https://platform.openai.com/api-keys" };
   }
   if (process.env.GEMINI_API_KEY) {
-    return { state: "active", resolvedProvider: "gemini (auto-detected)", reason: "GEMINI_API_KEY found — Gemini 1.5 Flash will be used" };
+    const v = await verifyAiKey("gemini", process.env.GEMINI_API_KEY);
+    if (v.ok) return { state: "active", resolvedProvider: "gemini (auto-detected)", reason: "✓ GEMINI_API_KEY verified — Gemini 1.5 Flash will be used" };
+    return { state: "misconfigured", resolvedProvider: "gemini", reason: `GEMINI_API_KEY set but invalid: ${v.error}`, action: "Get a new key at https://aistudio.google.com/app/apikey" };
+  }
+  if (process.env.GROQ_API_KEY) {
+    const v = await verifyAiKey("groq", process.env.GROQ_API_KEY);
+    if (v.ok) return { state: "active", resolvedProvider: "groq (auto-detected)", reason: "✓ GROQ_API_KEY verified — llama-3.1-8b-instant (free tier) will be used" };
+    return { state: "misconfigured", resolvedProvider: "groq", reason: `GROQ_API_KEY set but invalid: ${v.error}`, action: "Get a new free key at https://console.groq.com/keys" };
   }
 
+  // No key configured — AI analysis will be skipped
   return {
-    state: "misconfigured", resolvedProvider: null,
-    reason: "No AI provider key found in environment",
+    state: "misconfigured",
+    resolvedProvider: null,
+    reason: "No AI provider key set — AI security analysis is disabled",
     action: [
-      'Set ONE of these in your shell profile (~/.zshrc or ~/.bashrc):',
-      '  Anthropic (Claude) → export ANTHROPIC_API_KEY="sk-ant-..."   https://console.anthropic.com/settings/keys',
-      '  OpenAI             → export OPENAI_API_KEY="sk-..."           https://platform.openai.com/api-keys',
-      '  Google Gemini      → export GEMINI_API_KEY="AIza..."          https://aistudio.google.com/app/apikey',
-      '  Ollama (local, free) → set checks.ai.provider: "ollama" in .quality-loop.json, then: ollama pull llama3.2',
-      '',
-      'The provider is auto-detected from whichever key you set first.',
-    ].join('\n'),
+      "Get a free Groq API key (no installation, generous free tier):",
+      "  1. Sign up at https://console.groq.com",
+      "  2. Go to https://console.groq.com/keys → Create API Key",
+      '  3. export GROQ_API_KEY="gsk_..."',
+      "  4. source ~/.zshrc",
+      "  — or run: npx agent-quality-loop --configure",
+    ].join("\n"),
   };
 }
 

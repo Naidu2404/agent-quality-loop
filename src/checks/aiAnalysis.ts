@@ -5,17 +5,20 @@
  *   • Dependency misuse patterns (unsafe eval, prototype pollution, command injection)
  *
  * Supported providers (set checks.ai.provider in .quality-loop.json):
- *   • anthropic — ANTHROPIC_API_KEY  — claude-haiku-4-5-20251001 (default)
- *   • openai    — OPENAI_API_KEY     — gpt-4o-mini (default)
- *   • gemini    — GEMINI_API_KEY     — gemini-1.5-flash (default)
- *   • ollama    — no key needed      — llama3.2 (default, runs locally)
+ *   • groq      — GROQ_API_KEY       — llama-3.1-8b-instant (free tier, cloud, no download)
+ *   • anthropic — ANTHROPIC_API_KEY  — claude-haiku-4-5-20251001
+ *   • openai    — OPENAI_API_KEY     — gpt-4o-mini
+ *   • gemini    — GEMINI_API_KEY     — gemini-1.5-flash (free tier)
+ *   • ollama    — no key needed      — llama3.2 (runs locally, explicit only)
  *
  * The provider auto-detects which key is present if none is explicitly configured.
+ * With no key set, AI analysis is gracefully skipped with a setup hint.
  */
 
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import type { Issue, AiCheckConfig, AiProvider } from "../types.js";
+import { ensureOllamaReady, DEFAULT_OLLAMA_MODEL } from "./ollamaManager.js";
 
 interface CheckResult {
   issues: Issue[];
@@ -36,10 +39,11 @@ interface AiIssue {
 
 // Default cheap/fast models per provider
 const DEFAULT_MODELS: Record<AiProvider, string> = {
+  groq:      "llama-3.1-8b-instant",
   anthropic: "claude-haiku-4-5-20251001",
-  openai: "gpt-4o-mini",
-  gemini: "gemini-1.5-flash",
-  ollama: "llama3.2",
+  openai:    "gpt-4o-mini",
+  gemini:    "gemini-1.5-flash",
+  ollama:    "llama3.2",
 };
 
 const DEFAULT_MAX_FILE_KB = 40;
@@ -60,15 +64,16 @@ export async function runAiAnalysis(
     };
   }
 
-  // Resolve which provider to use
+  // Resolve which provider to use (null = no key configured, skip gracefully)
   const provider = resolveProvider(config.provider);
-  if (!provider) {
+  if (provider === null) {
     return {
       issues: [],
       skipped: true,
       skipReason:
-        "No AI provider configured and no API key found in environment. " +
-        "Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY — or set checks.ai.provider=\"ollama\" for local inference.",
+        "No AI provider configured. Get a free Groq key for AI security analysis: " +
+        "https://console.groq.com/keys — then set GROQ_API_KEY in your environment, " +
+        "or run: npx agent-quality-loop --configure",
     };
   }
 
@@ -104,6 +109,9 @@ export async function runAiAnalysis(
     let responseText: string;
 
     switch (provider) {
+      case "groq":
+        responseText = await callGroq(model, systemPrompt, userPrompt);
+        break;
       case "anthropic":
         responseText = await callAnthropic(model, systemPrompt, userPrompt);
         break;
@@ -143,21 +151,22 @@ export async function runAiAnalysis(
 // ─── Provider resolution ──────────────────────────────────────────────────────
 
 /**
- * Resolves the provider to use.
- * If explicitly set in config, use that.
- * Otherwise, auto-detect from whichever API key is present in the environment.
+ * Resolves the provider to use, or null if no key is configured.
+ *
+ * Priority:
+ *   1. Explicitly configured provider in .quality-loop.json
+ *   2. API key auto-detection: anthropic → openai → gemini → groq
+ *   3. null — AI analysis is skipped; user sees a setup hint pointing to Groq (free)
+ *
+ * Note: ollama is only used when explicitly configured — it is NOT an auto-fallback.
  */
 function resolveProvider(configured?: AiProvider): AiProvider | null {
   if (configured) return configured;
-
-  // Auto-detect from env
   if (process.env.ANTHROPIC_API_KEY) return "anthropic";
-  if (process.env.OPENAI_API_KEY) return "openai";
-  if (process.env.GEMINI_API_KEY) return "gemini";
-
-  // Ollama: check if it's running locally (no key needed)
-  // We return it as a fallback — the actual call will fail if Ollama isn't running
-  return null;
+  if (process.env.OPENAI_API_KEY)    return "openai";
+  if (process.env.GEMINI_API_KEY)    return "gemini";
+  if (process.env.GROQ_API_KEY)      return "groq";
+  return null; // No key — skip AI analysis gracefully
 }
 
 // ─── Provider API calls ───────────────────────────────────────────────────────
@@ -254,14 +263,55 @@ async function callGemini(model: string, system: string, user: string): Promise<
   return data.candidates?.[0]?.content?.parts?.[0]?.text ?? "[]";
 }
 
+async function callGroq(model: string, system: string, user: string): Promise<string> {
+  const apiKey = process.env.GROQ_API_KEY!;
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 4096,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Groq API ${response.status}: ${err.slice(0, 200)}`);
+  }
+
+  const data = await response.json() as { choices: { message: { content: string } }[] };
+  const content = data.choices?.[0]?.message?.content ?? "[]";
+  try {
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed)) return content;
+    const arr = parsed.issues ?? parsed.results ?? parsed.findings ?? Object.values(parsed)[0];
+    return Array.isArray(arr) ? JSON.stringify(arr) : "[]";
+  } catch {
+    return content;
+  }
+}
+
 async function callOllama(
   model: string,
   system: string,
   user: string,
   baseUrl?: string
 ): Promise<string> {
-  const url = `${(baseUrl ?? "http://localhost:11434").replace(/\/$/, "")}/api/chat`;
+  // ensureOllamaReady downloads, starts, and pulls the model automatically.
+  // If baseUrl is overridden (pointing at a remote Ollama), skip managed startup.
+  const base = baseUrl
+    ? baseUrl.replace(/\/$/, "")
+    : await ensureOllamaReady(model);
 
+  const url = `${base}/api/chat`;
   const response = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -279,9 +329,7 @@ async function callOllama(
   if (!response.ok) {
     const err = await response.text();
     if (response.status === 404) {
-      throw new Error(
-        `Ollama model "${model}" not found. Run: ollama pull ${model}`
-      );
+      throw new Error(`Ollama model "${model}" not found — re-run the quality check and it will be pulled automatically`);
     }
     throw new Error(`Ollama API ${response.status}: ${err.slice(0, 200)}`);
   }

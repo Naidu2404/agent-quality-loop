@@ -7,6 +7,7 @@
 
 // ─── CLI flags — handle before anything else ──────────────────────────────────
 import { printHelp, printVersion, printStartupBanner } from "./cli/help.js";
+import { runConfigure } from "./cli/configure.js";
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
@@ -15,6 +16,10 @@ if (args.includes("--help") || args.includes("-h")) {
 }
 if (args.includes("--version") || args.includes("-v")) {
   printVersion();
+  process.exit(0);
+}
+if (args.includes("--configure") || args.includes("-c")) {
+  await runConfigure();
   process.exit(0);
 }
 
@@ -273,7 +278,7 @@ server.tool(
   },
   async ({ cwd }) => {
     try {
-      const result = checkSetup({ cwd });
+      const result = await checkSetup({ cwd });
       return {
         content: [
           { type: "text", text: result.setupPrompt },

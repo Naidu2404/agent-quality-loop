@@ -1,7 +1,7 @@
 {
   "name": "agent-quality-loop",
-  "version": "1.6.0",
-  "description": "MCP server that guides AI agents to produce clean, policy-compliant code — runs ESLint, TypeScript, Prettier and repo-specific rules, then returns structured issues the agent can act on immediately.",
+  "version": "2.0.0",
+  "description": "MCP server that guides AI agents to produce clean, policy-compliant code — runs ESLint, TypeScript, Prettier, AI security analysis (free via Groq), unused-code detection, dependency checks and more.",
   "keywords": [
     "mcp",
     "ai",

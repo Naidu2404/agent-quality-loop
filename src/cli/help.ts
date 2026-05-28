@@ -54,10 +54,19 @@ export function printHelp(): void {
   out(`     Claude    → claude_desktop_config.json`);
   out(`     Windsurf  → ~/.codeium/windsurf/mcp_config.json`);
   out();
-  out(`  2. Tell your agent to run setup_repo for your project:`);
+  out(`  2. (Optional) Add tokens to unlock AI and scanning:`);
+  out();
+  out(`     npx agent-quality-loop --configure`);
+  out();
+  out(`     3-step wizard — paste your tokens, they're tested and saved:`);
+  out(`       • Groq API key  — free AI security analysis (https://console.groq.com/keys)`);
+  out(`       • SonarCloud    — live issue scanning`);
+  out(`       • GitHub token  — Dependabot security alerts`);
+  out();
+  out(`  3. Tell your agent to run setup_repo for your project:`);
   out(`     "Call setup_repo with cwd: /path/to/your/repo"`);
   out();
-  out(`  3. Done. The agent now runs the quality loop automatically after`);
+  out(`  4. Done. The agent now runs the quality loop automatically after`);
   out(`     every code change — no manual intervention needed.`);
   out();
   out(`─────────────────────────────────────────────────────────────────────`);
@@ -88,9 +97,11 @@ export function printHelp(): void {
   out(`    Run this after setup_repo to confirm everything is working.`);
   out();
   out(`  identify_trace_code`);
-  out(`    Finds unused imports, variables, functions, types, duplicate imports,`);
-  out(`    dead code, and empty functions. Returns a removePrompt — agent applies`);
-  out(`    all safe removals immediately, then calls verify_trace_removal.`);
+  out(`    Finds unused imports, variables, functions, types, classes, exports,`);
+  out(`    class/enum members, duplicate imports/exports, unnecessary/missing`);
+  out(`    dependencies, unused files, dead code, and empty functions.`);
+  out(`    Returns a removePrompt — agent applies all safe removals immediately,`);
+  out(`    then calls verify_trace_removal.`);
   out();
   out(`  verify_trace_removal`);
   out(`    Verifies trace code removals didn't break anything. Runs tsc + ESLint`);
@@ -100,15 +111,17 @@ export function printHelp(): void {
   out();
   out(`  AI ANALYSIS — pick any one provider`);
   out();
-  out(`  The AI check uses your existing API key — no new accounts needed.`);
+  out(`  Groq is recommended — free tier, no install, generous daily limits.`);
   out();
   out(`  Provider       Key                   Free?   Default model`);
   out(`  ──────────     ───────────────────   ──────  ─────────────────────`);
-  out(`  Anthropic      ANTHROPIC_API_KEY      No*    claude-haiku-4-5-20251001`);
-  out(`  OpenAI         OPENAI_API_KEY         No*    gpt-4o-mini`);
-  out(`  Google Gemini  GEMINI_API_KEY         Yes†   gemini-1.5-flash`);
-  out(`  Ollama         (none — runs locally)  Yes    llama3.2`);
+  out(`  Groq           GROQ_API_KEY          Yes‡   llama-3.1-8b-instant`);
+  out(`  Anthropic      ANTHROPIC_API_KEY     No*    claude-haiku-4-5-20251001`);
+  out(`  OpenAI         OPENAI_API_KEY        No*    gpt-4o-mini`);
+  out(`  Google Gemini  GEMINI_API_KEY        Yes†   gemini-1.5-flash`);
+  out(`  Ollama         (none — runs locally) Yes    llama3.2`);
   out();
+  out(`  ‡ Groq: 14,400 free requests/day — more than enough for any team`);
   out(`  * Both have free tiers / very low cost (~$0.001 per review)`);
   out(`  † Gemini has a free tier generous enough for most teams`);
   out();
@@ -151,6 +164,7 @@ export function printHelp(): void {
   out();
   out(`  ENVIRONMENT VARIABLES`);
   out();
+  out(`  GROQ_API_KEY        → console.groq.com/keys  (free — recommended)`);
   out(`  ANTHROPIC_API_KEY   → console.anthropic.com/settings/keys`);
   out(`  OPENAI_API_KEY      → platform.openai.com/api-keys`);
   out(`  GEMINI_API_KEY      → aistudio.google.com/app/apikey`);
@@ -195,7 +209,7 @@ export function printStartupBanner(cwd: string): void {
   if (aiProvider) {
     out(`  AI analysis: ✓ ${aiProvider}`);
   } else {
-    out(`  AI analysis: — no key detected (run check_setup for setup guide)`);
+    out(`  AI analysis: — no key detected (run --configure to add a free Groq key)`);
   }
 
   const hasSonar = !!process.env.SONAR_TOKEN;
@@ -216,5 +230,6 @@ function detectAiProvider(): string | null {
   if (process.env.ANTHROPIC_API_KEY) return "Anthropic (Claude Haiku)";
   if (process.env.OPENAI_API_KEY) return "OpenAI (GPT-4o-mini)";
   if (process.env.GEMINI_API_KEY) return "Google Gemini (1.5 Flash)";
+  if (process.env.GROQ_API_KEY)   return "Groq (llama-3.1-8b-instant, free tier)";
   return null;
 }

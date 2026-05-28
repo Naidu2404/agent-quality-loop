@@ -91,17 +91,18 @@ export interface FileSizeRule {
   fixHint?: string;
 }
 
-export type AiProvider = "anthropic" | "openai" | "gemini" | "ollama";
+export type AiProvider = "anthropic" | "openai" | "gemini" | "groq" | "ollama";
 
 export interface AiCheckConfig {
   enabled: boolean;
   /**
    * Which AI provider to use for analysis.
-   * • anthropic — requires ANTHROPIC_API_KEY  (default model: claude-haiku-4-5-20251001)
-   * • openai    — requires OPENAI_API_KEY     (default model: gpt-4o-mini)
-   * • gemini    — requires GEMINI_API_KEY     (default model: gemini-1.5-flash)
-   * • ollama    — no key needed, runs locally (default model: llama3.2)
-   * Default: "anthropic"
+   * • groq      — GROQ_API_KEY (free tier!)   (default model: llama-3.1-8b-instant)
+   * • anthropic — ANTHROPIC_API_KEY            (default model: claude-haiku-4-5-20251001)
+   * • openai    — OPENAI_API_KEY               (default model: gpt-4o-mini)
+   * • gemini    — GEMINI_API_KEY (free tier)   (default model: gemini-1.5-flash)
+   * • ollama    — no key, runs locally         (default model: llama3.2)
+   * Default: auto-detect from env vars. Set GROQ_API_KEY for free cloud AI.
    */
   provider?: AiProvider;
   /**

@@ -69,7 +69,8 @@ export async function identifyTraceCode(
     };
   }
 
-  const result = runTraceCodeAnalysis(files, cwd, stackInfo);
+  const isWorkspaceWide = input.files?.includes("*") ?? false;
+  const result = runTraceCodeAnalysis(files, cwd, stackInfo, { workspaceWide: isWorkspaceWide });
   const passesCheck = result.totalItems === 0;
 
   const removePrompt = passesCheck
@@ -175,7 +176,7 @@ function buildSummary(
   }
 
   lines.push("");
-  lines.push("**Next step:** Read `removePrompt` and apply all safe removals. Then call `verify_trace_removal`.");
+  lines.push("**Next step:** Read `removePrompt` and apply all safe removals (for deps: run npm uninstall/install). Then call `verify_trace_removal`.");
 
   return lines.join("\n");
 }

@@ -1,6 +1,6 @@
 import { execSync } from "child_process";
 import { existsSync, readFileSync } from "fs";
-import { join, relative } from "path";
+import { join, relative, basename, extname } from "path";
 import { globSync } from "glob";
 import type { DetectedStack } from "../types.js";
 
@@ -16,7 +16,13 @@ export type TraceKind =
   | "commented-code"
   | "empty-function"
   | "dead-code-after-return"
-  | "duplicate-import";
+  | "duplicate-import"
+  | "unused-file"
+  | "unused-dep"
+  | "missing-dep"
+  | "unused-class-member"
+  | "unused-enum-member"
+  | "duplicate-export";
 
 export type RemovalSafety = "safe" | "review-required";
 
@@ -52,11 +58,13 @@ export interface TraceCodeResult {
 export function runTraceCodeAnalysis(
   files: string[],
   cwd: string,
-  stack: DetectedStack
+  stack: DetectedStack,
+  options?: { workspaceWide?: boolean }
 ): TraceCodeResult {
   const items: TraceItem[] = [];
   const checksRun: string[] = [];
   const checksSkipped: { check: string; reason: string }[] = [];
+  const workspaceWide = options?.workspaceWide ?? false;
 
   // 1. TypeScript unused locals/parameters
   if (stack.hasTypeScript) {
@@ -78,10 +86,28 @@ export function runTraceCodeAnalysis(
     items.push(...eslintResult.items);
   }
 
-  // 3. Pattern-based checks (all stacks)
+  // 3. Pattern-based checks (all stacks) — includes class members, enum members, duplicate exports
   const patternResult = detectViaPatterns(files, cwd, stack);
   checksRun.push("patterns");
   items.push(...patternResult);
+
+  // 4. Workspace-level: unused deps + missing deps (always run — uses package.json)
+  const hasPkgJson = existsSync(join(cwd, "package.json"));
+  if (hasPkgJson) {
+    const allWorkspaceFiles = getWorkspaceSourceFiles(cwd);
+    detectUnusedDeps(cwd, allWorkspaceFiles, items);
+    detectMissingDeps(cwd, allWorkspaceFiles, items);
+    checksRun.push("deps");
+  } else {
+    checksSkipped.push({ check: "deps", reason: "no package.json" });
+  }
+
+  // 5. Unused files — only run when doing a workspace-wide scan
+  if (workspaceWide) {
+    const allWorkspaceFiles = getWorkspaceSourceFiles(cwd);
+    detectUnusedFiles(cwd, allWorkspaceFiles, items);
+    checksRun.push("unused-files");
+  }
 
   // Deduplicate by path+line+kind
   const seen = new Set<string>();
@@ -123,7 +149,6 @@ function detectUnusedViaTypeScript(
 
   let output = "";
   try {
-    // Run with noUnusedLocals + noUnusedParameters overrides
     execSync(
       `"${tscBin}" --noEmit --pretty false --noUnusedLocals --noUnusedParameters -p "${tsconfigPath}"`,
       { cwd, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
@@ -321,7 +346,6 @@ function detectViaPatterns(
       // Vue-specific: unused registered components
       if (file.endsWith(".vue") && stack.primary === "vue") {
         if (/components\s*:\s*\{/.test(trimmed)) {
-          // Check next lines for component registrations
           for (let j = idx + 1; j < Math.min(idx + 20, lines.length); j++) {
             const compLine = lines[j].trim();
             const compMatch = compLine.match(/^\s*([A-Z][a-zA-Z0-9]+)\s*[,}]/);
@@ -352,6 +376,21 @@ function detectViaPatterns(
     if (stack.hasTypeScript && (file.endsWith(".ts") || file.endsWith(".vue"))) {
       detectUnusedExports(file, cwd, content, items);
     }
+
+    // NEW: Unused private class members
+    if (file.endsWith(".ts") || file.endsWith(".tsx") || file.endsWith(".vue")) {
+      detectUnusedClassMembers(file, content, items);
+    }
+
+    // NEW: Unused enum members
+    if (file.endsWith(".ts") || file.endsWith(".tsx")) {
+      detectUnusedEnumMembers(file, cwd, content, items);
+    }
+
+    // NEW: Duplicate exports
+    if (file.endsWith(".ts") || file.endsWith(".tsx") || file.endsWith(".js") || file.endsWith(".mjs")) {
+      detectDuplicateExports(file, content, items);
+    }
   }
 
   return items;
@@ -370,17 +409,14 @@ function detectUnusedExports(
   lines.forEach((line, idx) => {
     const trimmed = line.trim();
 
-    // Find named exports that are not re-exports
     const exportMatch = trimmed.match(
       /^export\s+(?:const|function|class|type|interface|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)/
     );
     if (!exportMatch) return;
 
     const symbol = exportMatch[1];
-    // Skip default exports and common entry-point names
     if (["default", "setup", "defineComponent"].includes(symbol)) return;
 
-    // Search the rest of the codebase for references
     const searchFiles = globSync("src/**/*.{ts,tsx,vue,js}", { cwd, nodir: true });
     let refCount = 0;
     for (const f of searchFiles) {
@@ -406,6 +442,495 @@ function detectUnusedExports(
       });
     }
   });
+}
+
+// ─── NEW: Unused private class members ───────────────────────────────────────
+
+function detectUnusedClassMembers(
+  file: string,
+  content: string,
+  items: TraceItem[]
+): void {
+  const lines = content.split("\n");
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+
+    // private field: private foo = / private readonly foo: / private foo!:
+    const fieldMatch = trimmed.match(/^private\s+(?:readonly\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*[=:!;]/);
+    // private method: private foo( / private async foo(
+    const methodMatch = trimmed.match(/^private\s+(?:async\s+)?(?:static\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/);
+
+    const name = fieldMatch?.[1] ?? methodMatch?.[1];
+    if (!name || name === "constructor") continue;
+
+    // Count this.name references excluding the declaration line
+    const refRe = new RegExp(`\\bthis\\.${name}\\b`);
+    let refCount = 0;
+    for (let j = 0; j < lines.length; j++) {
+      if (j === i) continue;
+      if (refRe.test(lines[j])) { refCount++; break; }
+    }
+
+    if (refCount === 0) {
+      const ctx = buildContext(lines, i);
+      items.push({
+        path: file,
+        line: i + 1,
+        kind: "unused-class-member",
+        symbol: name,
+        sourceLine: trimmed,
+        sourceContext: ctx,
+        safety: "safe",
+        removeInstruction: `${file}:${i + 1}: Private member '${name}' is never referenced (no this.${name} found) — delete the declaration.`,
+      });
+    }
+  }
+}
+
+// ─── NEW: Unused enum members ─────────────────────────────────────────────────
+
+function detectUnusedEnumMembers(
+  file: string,
+  cwd: string,
+  content: string,
+  items: TraceItem[]
+): void {
+  const lines = content.split("\n");
+
+  for (let i = 0; i < lines.length; i++) {
+    const enumMatch = lines[i].trim().match(/^(?:export\s+)?(?:const\s+)?enum\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\{/);
+    if (!enumMatch) continue;
+
+    const enumName = enumMatch[1];
+    const members: { name: string; lineIdx: number }[] = [];
+
+    for (let j = i + 1; j < lines.length; j++) {
+      const memberLine = lines[j].trim();
+      if (memberLine.startsWith("}")) break;
+      // Match enum member names (allow string/numeric values)
+      const memberMatch = memberLine.match(/^([A-Za-z_$][A-Za-z0-9_$]*)\s*[=,}]?/);
+      if (memberMatch && memberMatch[1] !== "") {
+        members.push({ name: memberMatch[1], lineIdx: j });
+      }
+    }
+
+    const searchFiles = globSync("src/**/*.{ts,tsx,vue,js}", { cwd, nodir: true });
+
+    for (const member of members) {
+      const refPattern = new RegExp(`${enumName}\\.${member.name}\\b`);
+      let found = false;
+
+      for (const f of searchFiles) {
+        try {
+          const fc = readFileSync(join(cwd, f), "utf8");
+          if (refPattern.test(fc)) { found = true; break; }
+        } catch {}
+      }
+
+      if (!found) {
+        const ctx = buildContext(lines, member.lineIdx);
+        items.push({
+          path: file,
+          line: member.lineIdx + 1,
+          kind: "unused-enum-member",
+          symbol: `${enumName}.${member.name}`,
+          sourceLine: lines[member.lineIdx].trim(),
+          sourceContext: ctx,
+          safety: "review-required",
+          safetyNote: `Enum member '${enumName}.${member.name}' has no references in src/. May be used externally or in tests.`,
+          removeInstruction: `${file}:${member.lineIdx + 1}: Enum member '${enumName}.${member.name}' has no references — verify it's not used in tests/external, then delete.`,
+        });
+      }
+    }
+  }
+}
+
+// ─── NEW: Duplicate exports ───────────────────────────────────────────────────
+
+function detectDuplicateExports(
+  file: string,
+  content: string,
+  items: TraceItem[]
+): void {
+  const lines = content.split("\n");
+  const exportedSymbols = new Map<string, number>(); // symbol → first export line (1-based)
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+
+    // Named export declaration: export const/function/class/type/interface/enum Foo
+    const namedMatch = trimmed.match(
+      /^export\s+(?:const|function|async\s+function|class|type|interface|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)/
+    );
+    if (namedMatch) {
+      const sym = namedMatch[1];
+      if (exportedSymbols.has(sym)) {
+        const ctx = buildContext(lines, i);
+        items.push({
+          path: file,
+          line: i + 1,
+          kind: "duplicate-export",
+          symbol: sym,
+          sourceLine: trimmed,
+          sourceContext: ctx,
+          safety: "safe",
+          safetyNote: `'${sym}' was first exported at line ${exportedSymbols.get(sym)}.`,
+          removeInstruction: `${file}:${i + 1}: '${sym}' duplicate export (first at L${exportedSymbols.get(sym)}) — remove this declaration.`,
+        });
+      } else {
+        exportedSymbols.set(sym, i + 1);
+      }
+    }
+
+    // Re-export list: export { Foo, Bar as Baz }
+    const reExportMatch = trimmed.match(/^export\s*\{([^}]+)\}/);
+    if (reExportMatch) {
+      const symbols = reExportMatch[1].split(",").map((s) => {
+        const parts = s.trim().split(/\s+as\s+/);
+        return (parts[1] ?? parts[0]).trim();
+      }).filter(Boolean);
+
+      for (const sym of symbols) {
+        if (exportedSymbols.has(sym)) {
+          const ctx = buildContext(lines, i);
+          items.push({
+            path: file,
+            line: i + 1,
+            kind: "duplicate-export",
+            symbol: sym,
+            sourceLine: trimmed,
+            sourceContext: ctx,
+            safety: "safe",
+            safetyNote: `'${sym}' was first exported at line ${exportedSymbols.get(sym)}.`,
+            removeInstruction: `${file}:${i + 1}: '${sym}' duplicate re-export (first at L${exportedSymbols.get(sym)}) — remove from this export list.`,
+          });
+        } else {
+          exportedSymbols.set(sym, i + 1);
+        }
+      }
+    }
+  }
+}
+
+// ─── NEW: Workspace source files ─────────────────────────────────────────────
+
+/**
+ * Returns all source files across the workspace (including monorepo packages).
+ */
+function getWorkspaceSourceFiles(cwd: string): string[] {
+  const patterns = [
+    "src/**/*.{ts,tsx,vue,js,jsx,mjs}",
+    "lib/**/*.{ts,js}",
+    "app/**/*.{ts,vue,js}",
+    "packages/*/src/**/*.{ts,tsx,vue,js,jsx}",
+    "apps/*/src/**/*.{ts,tsx,vue,js,jsx}",
+  ];
+  return globSync(patterns, {
+    cwd,
+    nodir: true,
+    ignore: ["node_modules/**", "dist/**", "**/*.d.ts", "**/*.spec.*", "**/*.test.*"],
+  });
+}
+
+/**
+ * Detects monorepo workspace roots (npm/yarn workspaces + pnpm).
+ * Returns all workspace package paths (relative to cwd).
+ */
+function getWorkspacePackageDirs(cwd: string): string[] {
+  const dirs: string[] = [];
+
+  // npm / yarn workspaces in package.json
+  const pkgPath = join(cwd, "package.json");
+  if (existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as Record<string, unknown>;
+      const ws = pkg.workspaces;
+      const patterns: string[] = Array.isArray(ws)
+        ? ws as string[]
+        : (ws as { packages?: string[] } | undefined)?.packages ?? [];
+      for (const pattern of patterns) {
+        // Find package.json files to discover workspace package directories
+        const pkgJsonFiles = globSync(`${pattern.replace(/\/?$/, "")}/package.json`, { cwd, ignore: ["node_modules/**"] });
+        dirs.push(...pkgJsonFiles.map((f) => f.replace(/\/package\.json$/, "")));
+      }
+    } catch {}
+  }
+
+  // pnpm workspaces
+  const pnpmWs = join(cwd, "pnpm-workspace.yaml");
+  if (existsSync(pnpmWs)) {
+    try {
+      const content = readFileSync(pnpmWs, "utf8");
+      const packageLines = content.match(/- ['"]?([^'"\n]+)['"]?/g) ?? [];
+      for (const line of packageLines) {
+        const pattern = line.replace(/- ['"]?([^'"\n]+)['"]?/, "$1").trim();
+        if (!pattern) continue;
+        const pkgJsonFiles = globSync(`${pattern.replace(/\/?$/, "")}/package.json`, { cwd, ignore: ["node_modules/**"] });
+        dirs.push(...pkgJsonFiles.map((f) => f.replace(/\/package\.json$/, "")));
+      }
+    } catch {}
+  }
+
+  return dirs;
+}
+
+// ─── NEW: Unused files ────────────────────────────────────────────────────────
+
+function detectUnusedFiles(
+  cwd: string,
+  allSourceFiles: string[],
+  items: TraceItem[]
+): void {
+  // Entry points and patterns that are never "imported" in the traditional sense
+  const ENTRY_PATTERNS = [
+    /\bindex\.(ts|tsx|js|jsx|vue)$/i,
+    /\bmain\.(ts|tsx|js|jsx)$/i,
+    /\bApp\.(vue|tsx|jsx|ts)$/i,
+    /\bapp\.(ts|tsx|js|jsx|vue)$/i,
+    /\.config\.(ts|js|mjs|cjs)$/i,
+    /\.d\.ts$/i,
+    /\bRouter\.(ts|js)$/i,
+    /\brouter\/(index|routes)\.(ts|js)$/i,
+    /\bstore\/(index|pinia)\.(ts|js)$/i,
+    /\bplugins\//i,
+  ];
+
+  // Build a set of all imported path fragments from all source files
+  const importedFragments = new Set<string>();
+
+  for (const file of allSourceFiles) {
+    try {
+      const content = readFileSync(join(cwd, file), "utf8");
+      // Static imports: import X from '...' / export { X } from '...'
+      const staticRe = /(?:import|export)\s+(?:.+?\s+from\s+)?['"]([^'"]+)['"]/g;
+      // Dynamic imports: import('...')
+      const dynamicRe = /import\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+      // Require: require('...')
+      const requireRe = /require\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+
+      for (const re of [staticRe, dynamicRe, requireRe]) {
+        for (const match of content.matchAll(re)) {
+          importedFragments.add(match[1]);
+        }
+      }
+    } catch {}
+  }
+
+  for (const file of allSourceFiles) {
+    if (ENTRY_PATTERNS.some((p) => p.test(file))) continue;
+
+    // Build candidate paths for this file (without extension, with/without subpath)
+    const withoutExt = file.replace(/\.(ts|tsx|js|jsx|vue|mjs)$/, "");
+    const fileStem = basename(file, extname(file));
+
+    let isImported = false;
+    for (const fragment of importedFragments) {
+      // The import might use: './Foo', '../bar/Baz', '@/components/Foo', 'Foo' etc.
+      if (
+        fragment.endsWith("/" + fileStem) ||
+        fragment.endsWith("/" + fileStem + ".vue") ||
+        fragment.endsWith("/" + fileStem + ".ts") ||
+        fragment.includes(withoutExt) ||
+        fragment === `./${fileStem}` ||
+        fragment === fileStem
+      ) {
+        isImported = true;
+        break;
+      }
+    }
+
+    if (!isImported) {
+      items.push({
+        path: file,
+        line: 1,
+        kind: "unused-file",
+        sourceLine: `// ${file}`,
+        sourceContext: `→ 1: (entire file — no imports found in workspace)`,
+        safety: "review-required",
+        safetyNote: `File has no imports from other source files. May be a route component, lazy-loaded module, or test fixture.`,
+        removeInstruction: `FILE '${file}': No other source file imports it. Verify it's not a route, dynamic import target, or fixture — then delete the file.`,
+      });
+    }
+  }
+}
+
+// ─── NEW: Unnecessary dependencies ───────────────────────────────────────────
+
+/**
+ * Packages that are legitimately used without direct imports (build tools, type packages, etc.)
+ */
+const SKIP_DEP_CHECK = new Set([
+  "typescript", "ts-node", "ts-jest",
+  "@types/node", "@types/vue", "@types/react", "@types/react-dom",
+  "eslint", "prettier", "husky", "lint-staged", "commitlint",
+  "@commitlint/cli", "@commitlint/config-conventional",
+  "vite", "webpack", "rollup", "esbuild", "parcel",
+  "vitest", "jest", "mocha", "chai", "jasmine", "karma",
+  "@vue/test-utils", "@testing-library/vue", "@testing-library/react",
+  "vue-tsc", "nodemon", "concurrently", "cross-env",
+  "@vitejs/plugin-vue", "@vitejs/plugin-react",
+  "postcss", "autoprefixer", "tailwindcss", "sass",
+]);
+
+function detectUnusedDeps(
+  cwd: string,
+  allSourceFiles: string[],
+  items: TraceItem[]
+): void {
+  const pkgPath = join(cwd, "package.json");
+  if (!existsSync(pkgPath)) return;
+
+  let pkg: Record<string, unknown>;
+  try { pkg = JSON.parse(readFileSync(pkgPath, "utf8")); } catch { return; }
+
+  const deps: Record<string, string> = {
+    ...(pkg.dependencies as Record<string, string> | undefined ?? {}),
+    ...(pkg.devDependencies as Record<string, string> | undefined ?? {}),
+  };
+
+  // Also scan config files and root-level JS files for require/import
+  const configFiles = globSync("*.{ts,js,mjs,cjs}", { cwd, nodir: true, ignore: ["node_modules/**"] });
+  const filesToScan = [...allSourceFiles, ...configFiles];
+
+  // Build set of all imported package names
+  const importedPkgs = new Set<string>();
+  for (const file of filesToScan) {
+    try {
+      const content = readFileSync(join(cwd, file), "utf8");
+      const importRe = /from\s+['"]([^'"./][^'"]*)['"]/g;
+      const requireRe = /require\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\)/g;
+      for (const re of [importRe, requireRe]) {
+        for (const match of content.matchAll(re)) {
+          const raw = match[1];
+          // Normalise to package root: '@org/pkg/subpath' → '@org/pkg'
+          const pkgRoot = raw.startsWith("@")
+            ? raw.split("/").slice(0, 2).join("/")
+            : raw.split("/")[0];
+          importedPkgs.add(pkgRoot);
+        }
+      }
+    } catch {}
+  }
+
+  const pkgLines = readFileSync(pkgPath, "utf8").split("\n");
+
+  for (const [depName, version] of Object.entries(deps)) {
+    if (SKIP_DEP_CHECK.has(depName)) continue;
+    if (depName.startsWith("@types/")) continue;
+    if (depName.startsWith("eslint-")) continue;
+    if (depName.startsWith("@typescript-eslint/")) continue;
+    if (depName.startsWith("@eslint/")) continue;
+    if (depName.startsWith("babel-")) continue;
+    if (depName.startsWith("@babel/")) continue;
+    if (importedPkgs.has(depName)) continue;
+
+    // Find line number in package.json
+    const lineIdx = pkgLines.findIndex((l) => l.includes(`"${depName}"`));
+    const lineNum = lineIdx >= 0 ? lineIdx + 1 : 1;
+    const sourceLine = pkgLines[lineIdx]?.trim() ?? `"${depName}": "${version}"`;
+
+    items.push({
+      path: "package.json",
+      line: lineNum,
+      kind: "unused-dep",
+      symbol: depName,
+      sourceLine,
+      sourceContext: `→ ${lineNum}: ${sourceLine}`,
+      safety: "review-required",
+      safetyNote: `'${depName}' is in package.json but no source file imports it. May be used in config files or scripts not scanned.`,
+      removeInstruction: `package.json:${lineNum}: '${depName}' appears unused in source files — verify then run: npm uninstall ${depName}`,
+    });
+  }
+}
+
+// ─── NEW: Missing dependencies ────────────────────────────────────────────────
+
+/** Node.js built-in module names */
+const NODE_BUILTINS = new Set([
+  "fs", "path", "os", "child_process", "http", "https", "net", "stream",
+  "events", "util", "crypto", "buffer", "url", "querystring", "readline",
+  "module", "assert", "zlib", "dns", "cluster", "worker_threads", "vm",
+  "perf_hooks", "inspector", "tls", "dgram", "v8", "process", "timers",
+  "string_decoder", "domain", "punycode", "constants",
+]);
+
+function detectMissingDeps(
+  cwd: string,
+  allSourceFiles: string[],
+  items: TraceItem[]
+): void {
+  const pkgPath = join(cwd, "package.json");
+  let allKnownDeps = new Set<string>();
+
+  if (existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as Record<string, unknown>;
+      const allDeps: Record<string, string> = {
+        ...(pkg.dependencies as Record<string, string> ?? {}),
+        ...(pkg.devDependencies as Record<string, string> ?? {}),
+        ...(pkg.peerDependencies as Record<string, string> ?? {}),
+        ...(pkg.optionalDependencies as Record<string, string> ?? {}),
+      };
+      allKnownDeps = new Set(Object.keys(allDeps));
+    } catch {}
+  }
+
+  // Also grab workspace packages so cross-package imports aren't flagged
+  const workspacePkgDirs = getWorkspacePackageDirs(cwd);
+  for (const dir of workspacePkgDirs) {
+    const wpPkg = join(cwd, dir, "package.json");
+    if (existsSync(wpPkg)) {
+      try {
+        const p = JSON.parse(readFileSync(wpPkg, "utf8")) as { name?: string };
+        if (p.name) allKnownDeps.add(p.name);
+      } catch {}
+    }
+  }
+
+  // Track missing packages (first occurrence only)
+  const missing = new Map<string, { file: string; line: number; importLine: string }>();
+
+  for (const file of allSourceFiles) {
+    try {
+      const content = readFileSync(join(cwd, file), "utf8");
+      const lines = content.split("\n");
+
+      lines.forEach((line, idx) => {
+        // Match top-level imports only (not dynamic, not require inside functions)
+        const importMatch = line.match(/^import\s+.+\s+from\s+['"]([^'"./][^'"]*)['"]/);
+        const requireMatch = line.match(/^(?:const|let|var)\s+.+\s*=\s*require\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\)/);
+        const raw = importMatch?.[1] ?? requireMatch?.[1];
+        if (!raw) return;
+
+        const pkgRoot = raw.startsWith("@")
+          ? raw.split("/").slice(0, 2).join("/")
+          : raw.split("/")[0];
+
+        if (
+          !allKnownDeps.has(pkgRoot) &&
+          !NODE_BUILTINS.has(pkgRoot) &&
+          !missing.has(pkgRoot)
+        ) {
+          missing.set(pkgRoot, { file, line: idx + 1, importLine: line.trim() });
+        }
+      });
+    } catch {}
+  }
+
+  for (const [pkgName, { file, line, importLine }] of missing) {
+    items.push({
+      path: file,
+      line,
+      kind: "missing-dep",
+      symbol: pkgName,
+      sourceLine: importLine,
+      sourceContext: `→ ${line}: ${importLine}`,
+      safety: "review-required",
+      safetyNote: `'${pkgName}' is imported but not listed in package.json.`,
+      removeInstruction: `${file}:${line}: '${pkgName}' is imported but missing from package.json — run: npm install ${pkgName}`,
+    });
+  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -488,6 +1013,18 @@ function buildRemoveInstruction(
       return `${loc}: Remove unused type/interface ${sym} — delete the type declaration.`;
     case "unused-class":
       return `${loc}: Remove unused class ${sym} — delete the class definition.`;
+    case "unused-class-member":
+      return `${loc}: Remove unused private class member ${sym} — delete the declaration.`;
+    case "unused-enum-member":
+      return `${loc}: Remove unused enum member ${sym} — delete the enum member line.`;
+    case "duplicate-export":
+      return `${loc}: Remove duplicate export of ${sym} — keep one export declaration and delete this.`;
+    case "unused-dep":
+      return `${loc}: Remove unused dependency ${sym} — run: npm uninstall ${symbol ?? ""}`;
+    case "missing-dep":
+      return `${loc}: Add missing dependency ${sym} — run: npm install ${symbol ?? ""}`;
+    case "unused-file":
+      return `FILE ${path}: No imports found — verify it's not a route/dynamic import, then delete the file.`;
     default:
       return `${loc}: Remove ${sym}.`;
   }
